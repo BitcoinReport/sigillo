@@ -1,0 +1,86 @@
+name: Build
+
+# Compila Sigillo per macOS, Windows e Linux ad ogni push, e carica i
+# pacchetti installabili come artifact scaricabili dalla pagina della run
+# (Actions -> questa run -> Artifacts). Comodo per far provare l'app a
+# qualcuno senza fargli installare Rust/Node: gli basta scaricare il file
+# giusto per il suo sistema operativo.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            name: macos
+          - platform: ubuntu-22.04
+            name: linux
+          - platform: windows-latest
+            name: windows
+
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Installa le dipendenze di sistema (solo Linux)
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libgtk-3-dev \
+            perl
+
+      - name: Installa Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache delle dipendenze Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            sigillo-core -> target
+            src-tauri -> target
+
+      - name: Installa Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Installa le dipendenze npm
+        run: npm ci
+
+      - name: Esegui i test del core crittografico
+        run: cargo test -p sigillo-core
+
+      - name: Build del pacchetto Sigillo (${{ matrix.name }})
+        run: npm run tauri build
+
+      - name: Carica il pacchetto come artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sigillo-${{ matrix.name }}
+          path: |
+            src-tauri/target/release/bundle/**/*.dmg
+            src-tauri/target/release/bundle/**/*.app
+            src-tauri/target/release/bundle/**/*.deb
+            src-tauri/target/release/bundle/**/*.rpm
+            src-tauri/target/release/bundle/**/*.AppImage
+            src-tauri/target/release/bundle/**/*.msi
+            src-tauri/target/release/bundle/**/*.exe
+          if-no-files-found: error

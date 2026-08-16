@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="it">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Sigillo</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <header class="app-header">
+      <h1>Sigillo</h1>
+      <p class="tagline">Scrivi, cifra, condividi. Nessuno tranne il destinatario puo leggere.</p>
+    </header>
+
+    <!-- ============ SCHERMATA 1: nessuna identita ============ -->
+    <section id="screen-setup" class="screen">
+      <div class="card">
+        <h2>Crea la tua identita</h2>
+        <p>
+          Questa identita ti serve per cifrare e decifrare i messaggi. Non serve
+          un'email, non serve una password su un server: tutto resta su questo
+          dispositivo.
+        </p>
+
+        <label for="display-name">Come vuoi chiamarti? (visibile solo ai tuoi contatti)</label>
+        <input id="display-name" type="text" placeholder="Es. Michele" />
+
+        <div class="word-count-choice">
+          <label><input type="radio" name="word-count" value="12" checked /> 12 parole</label>
+          <label><input type="radio" name="word-count" value="24" /> 24 parole (piu sicuro)</label>
+        </div>
+
+        <button id="btn-generate" class="primary">Genera nuova identita</button>
+
+        <hr />
+
+        <details>
+          <summary>Ho gia un'identita Sigillo (reinserisci la tua seed phrase)</summary>
+          <textarea id="import-phrase" rows="3" placeholder="Scrivi qui le 12 o 24 parole, separate da spazi"></textarea>
+          <button id="btn-import" class="secondary">Ripristina identita</button>
+        </details>
+
+        <p id="setup-error" class="error" hidden></p>
+      </div>
+    </section>
+
+    <!-- ============ SCHERMATA 2: conferma seed phrase ============ -->
+    <section id="screen-seed" class="screen" hidden>
+      <div class="card">
+        <h2>Scrivi questa frase su carta</h2>
+        <p class="warning">
+          Questa frase vale quanto la tua identita digitale. Chi la conosce puo
+          leggere i tuoi messaggi cifrati e firmare come te. Scrivila su carta,
+          non fotografarla, non salvarla su file.
+        </p>
+
+        <div id="seed-words" class="seed-grid"></div>
+
+        <button id="btn-seed-written" class="primary">L'ho scritta, continua</button>
+      </div>
+    </section>
+
+    <!-- ============ SCHERMATA 3: conferma di aver scritto la seed ============ -->
+    <section id="screen-confirm" class="screen" hidden>
+      <div class="card">
+        <h2>Verifica</h2>
+        <p>Per essere sicuri che tu l'abbia scritta bene, riscrivi qui le parole richieste.</p>
+
+        <div id="confirm-fields" class="confirm-grid"></div>
+
+        <button id="btn-confirm-check" class="primary">Verifica e continua</button>
+        <p id="confirm-error" class="error" hidden>Una o piu parole non corrispondono. Controlla i tuoi appunti.</p>
+      </div>
+    </section>
+
+    <!-- ============ SCHERMATA 4: app principale ============ -->
+    <section id="screen-main" class="screen" hidden>
+      <nav class="tabs">
+        <button class="tab-btn active" data-tab="tab-write">Scrivi</button>
+        <button class="tab-btn" data-tab="tab-decrypt">Decifra</button>
+        <button class="tab-btn" data-tab="tab-contacts">Rubrica</button>
+        <button class="tab-btn" data-tab="tab-identity">La mia identita</button>
+      </nav>
+
+      <div id="tab-write" class="tab-panel active">
+        <div class="card">
+          <h2>Nuovo messaggio</h2>
+
+          <label>Destinatari</label>
+          <div id="recipient-list" class="recipient-list">
+            <p class="hint">Nessun contatto in rubrica. Aggiungine uno dalla scheda "Rubrica".</p>
+          </div>
+
+          <label for="message-text">Messaggio</label>
+          <textarea id="message-text" rows="8" placeholder="Scrivi qui il tuo messaggio..."></textarea>
+
+          <label class="checkbox-row">
+            <input type="checkbox" id="sign-message" />
+            Firma questo messaggio (cosi sanno che sei stato tu)
+          </label>
+
+          <div class="button-row">
+            <button id="btn-encrypt" class="primary">Cifra</button>
+          </div>
+
+          <div id="encrypt-result" hidden>
+            <label for="ciphertext-out">Messaggio cifrato (.asc)</label>
+            <textarea id="ciphertext-out" rows="10" readonly></textarea>
+            <div class="button-row">
+              <button id="btn-copy-ciphertext" class="secondary">Copia</button>
+              <button id="btn-save-ciphertext" class="secondary">Salva come .asc...</button>
+            </div>
+          </div>
+
+          <p id="encrypt-error" class="error" hidden></p>
+        </div>
+      </div>
+
+      <div id="tab-decrypt" class="tab-panel">
+        <div class="card">
+          <h2>Decifra un messaggio</h2>
+          <p>Incolla qui il testo cifrato che hai ricevuto (inizia con "-----BEGIN PGP MESSAGE-----").</p>
+          <textarea id="ciphertext-in" rows="10" placeholder="-----BEGIN PGP MESSAGE-----..."></textarea>
+          <div class="button-row">
+            <button id="btn-load-file" class="secondary">Apri file...</button>
+            <button id="btn-decrypt" class="primary">Decifra</button>
+          </div>
+
+          <div id="decrypt-result" hidden>
+            <p id="signature-status" class="signature-status"></p>
+            <label for="plaintext-out">Messaggio in chiaro</label>
+            <textarea id="plaintext-out" rows="8" readonly></textarea>
+          </div>
+
+          <p id="decrypt-error" class="error" hidden></p>
+        </div>
+      </div>
+
+      <div id="tab-contacts" class="tab-panel">
+        <div class="card">
+          <h2>Rubrica</h2>
+          <p>Incolla la chiave pubblica di un contatto (blocco "-----BEGIN PGP PUBLIC KEY BLOCK-----").</p>
+
+          <label for="contact-name">Nome del contatto</label>
+          <input id="contact-name" type="text" placeholder="Es. Giulia" />
+
+          <label for="contact-key">Chiave pubblica</label>
+          <textarea id="contact-key" rows="6" placeholder="-----BEGIN PGP PUBLIC KEY BLOCK-----..."></textarea>
+
+          <div class="button-row">
+            <button id="btn-add-contact" class="primary">Aggiungi contatto</button>
+          </div>
+          <p id="contact-error" class="error" hidden></p>
+
+          <h3>Contatti salvati (in questa sessione)</h3>
+          <ul id="contact-list" class="contact-list"></ul>
+        </div>
+      </div>
+
+      <div id="tab-identity" class="tab-panel">
+        <div class="card">
+          <h2>La mia identita</h2>
+          <p><strong>Nome:</strong> <span id="my-name"></span></p>
+
+          <label>Impronta (fingerprint) — leggila a voce a un contatto per verificarla</label>
+          <p id="my-fingerprint-words" class="fingerprint-words"></p>
+          <p id="my-fingerprint-hex" class="fingerprint-hex"></p>
+
+          <label for="my-public-key">La tua chiave pubblica (condividila con chi vuole scriverti)</label>
+          <textarea id="my-public-key" rows="10" readonly></textarea>
+          <div class="button-row">
+            <button id="btn-copy-pubkey" class="secondary">Copia</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <script type="module" src="main.js"></script>
+  </body>
+</html>

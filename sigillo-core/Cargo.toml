@@ -1,0 +1,24 @@
+[package]
+name = "sigillo-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Core crittografico di Sigillo: identita BIP39, chiavi OpenPGP, cifratura/decifratura"
+
+[lib]
+name = "sigillo_core"
+path = "src/lib.rs"
+
+[dependencies]
+bip39 = { version = "2", features = ["rand", "zeroize"] }
+sequoia-openpgp = { version = "1", default-features = false, features = ["crypto-openssl"] }
+# Forza la compilazione (statica) di OpenSSL da sorgente, cosi il backend
+# crittografico di Sequoia non richiede OpenSSL/nettle gia installato sul
+# sistema dell'utente finale: il binario e autosufficiente su Windows/Mac/Linux.
+openssl = { version = "0.10", features = ["vendored"] }
+hkdf = "0.12"
+sha2 = "0.10"
+zeroize = { version = "1", features = ["zeroize_derive"] }
+anyhow = "1"
+
+[dev-dependencies]
