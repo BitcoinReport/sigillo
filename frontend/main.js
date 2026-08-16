@@ -62,6 +62,7 @@ function renderIdentity(view) {
     view.fingerprint_words.join("  ");
   document.getElementById("my-public-key").value = view.public_key_armored;
   document.getElementById("btn-open-advanced").hidden = false;
+  renderContactList();
 }
 
 function renderSeedGrid(words) {
@@ -103,7 +104,7 @@ function renderRecipientList() {
   const container = document.getElementById("recipient-list");
   if (contacts.length === 0) {
     container.innerHTML =
-      '<p class="hint">Nessun contatto in rubrica. Aggiungine uno dalla scheda "Rubrica".</p>';
+      '<p class="hint">Nessun contatto ancora — aggiungine uno dalla scheda "Rubrica" quando vuoi scrivere a qualcuno in modo cifrato.</p>';
     return;
   }
   container.innerHTML = "";
@@ -121,6 +122,12 @@ function renderRecipientList() {
 function renderContactList() {
   const list = document.getElementById("contact-list");
   list.innerHTML = "";
+  if (contacts.length === 0) {
+    list.innerHTML =
+      '<li class="hint empty-state">Nessun contatto ancora — aggiungine uno quando vuoi scrivere a qualcuno in modo cifrato.</li>';
+    renderRecipientList();
+    return;
+  }
   contacts.forEach((contact) => {
     const li = document.createElement("li");
     const nameSpan = document.createElement("span");
@@ -338,6 +345,13 @@ document.getElementById("btn-add-contact").addEventListener("click", async (e) =
       fingerprintWords: fp.fingerprint_words,
     });
     renderContactList();
+
+    const hintPanel = document.getElementById("contact-added-hint");
+    hintPanel.querySelector("p:first-child").textContent =
+      `${name} aggiunto/a. Per essere sicuro che sia davvero ${name} (e non qualcuno che finge di esserlo), leggi a voce queste parole a ${name} e verifica che corrispondano a quelle che vede anche ${name}:`;
+    hintPanel.querySelector(".fingerprint-words").textContent = fp.fingerprint_words.join("  ");
+    hintPanel.hidden = false;
+
     document.getElementById("contact-name").value = "";
     document.getElementById("contact-key").value = "";
   } catch (err) {
@@ -346,6 +360,16 @@ document.getElementById("btn-add-contact").addEventListener("click", async (e) =
 });
 
 // ---------- Scrivi / cifra ----------
+
+// La spiegazione della firma compare solo quando l'utente tocca/apre
+// l'opzione per la prima volta, non come testo sempre visibile.
+document.getElementById("sign-message").addEventListener(
+  "focus",
+  () => {
+    document.getElementById("sign-message-hint").hidden = false;
+  },
+  { once: true }
+);
 
 document.getElementById("btn-encrypt").addEventListener("click", async (e) => {
   setError("encrypt-error", null);
@@ -494,7 +518,8 @@ async function populateAdvancedScreen() {
   const contactsContainer = document.getElementById("adv-contacts");
   contactsContainer.innerHTML = "";
   if (contacts.length === 0) {
-    contactsContainer.innerHTML = '<p class="hint">Nessun contatto in rubrica.</p>';
+    contactsContainer.innerHTML =
+      '<p class="hint">Non hai ancora contatti in rubrica — qui vedrai i loro dettagli tecnici quando ne aggiungerai.</p>';
     return;
   }
   for (const contact of contacts) {

@@ -182,7 +182,7 @@
 
           <label>Destinatari</label>
           <div id="recipient-list" class="recipient-list">
-            <p class="hint">Nessun contatto in rubrica. Aggiungine uno dalla scheda "Rubrica".</p>
+            <p class="hint">Nessun contatto ancora — aggiungine uno dalla scheda "Rubrica" quando vuoi scrivere a qualcuno in modo cifrato.</p>
           </div>
 
           <label for="message-text">Messaggio</label>
@@ -190,8 +190,12 @@
 
           <label class="checkbox-row">
             <input type="checkbox" id="sign-message" />
-            Firma questo messaggio (cosi sanno che sei stato tu)
+            Firma questo messaggio
           </label>
+          <p id="sign-message-hint" class="hint reveal" hidden>
+            Aggiungi la tua firma digitale: chi riceve il messaggio potra
+            verificare che sei stato davvero tu a scriverlo.
+          </p>
 
           <div class="button-row">
             <button id="btn-encrypt" class="primary">Cifra</button>
@@ -246,7 +250,12 @@
           </div>
           <p id="contact-error" class="error" hidden></p>
 
-          <h3>Contatti salvati (in questa sessione)</h3>
+          <div id="contact-added-hint" class="reveal-panel" hidden>
+            <p></p>
+            <p class="fingerprint-words"></p>
+          </div>
+
+          <h3>I tuoi contatti</h3>
           <ul id="contact-list" class="contact-list"></ul>
         </div>
       </div>

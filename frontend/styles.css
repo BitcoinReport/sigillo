@@ -373,6 +373,28 @@ details summary {
   color: var(--muted);
 }
 
+.hint.reveal {
+  margin-top: 0.4rem;
+  font-size: 0.85rem;
+}
+
+.reveal-panel {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.85rem 1rem;
+  margin: 1rem 0;
+}
+
+.reveal-panel p:first-child {
+  margin: 0 0 0.5rem;
+  font-weight: 600;
+}
+
+.reveal-panel .fingerprint-words {
+  margin: 0;
+}
+
 .contact-list {
   list-style: none;
   padding: 0;
@@ -384,6 +406,12 @@ details summary {
   align-items: center;
   padding: 0.5rem 0;
   border-bottom: 1px solid var(--border);
+}
+
+.contact-list li.empty-state {
+  display: block;
+  border-bottom: none;
+  padding: 0.25rem 0;
 }
 
 .contact-list .fp {
