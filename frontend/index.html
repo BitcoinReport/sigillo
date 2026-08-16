@@ -18,12 +18,12 @@
     </header>
 
     <!-- ============ SCHERMATA: caricamento iniziale ============ -->
-    <section id="screen-loading" class="screen">
+    <section id="screen-loading" class="screen active">
       <div class="card"><p class="hint">Caricamento...</p></div>
     </section>
 
     <!-- ============ SCHERMATA: sblocco (identita gia presente su questo dispositivo) ============ -->
-    <section id="screen-unlock" class="screen" hidden>
+    <section id="screen-unlock" class="screen">
       <div class="card">
         <h2>Bentornato</h2>
         <p>Questo dispositivo ha gia un'identita Sigillo. Inserisci la passphrase che avevi scelto per sbloccarla.</p>
@@ -53,15 +53,28 @@
       </div>
     </section>
 
-    <!-- ============ SCHERMATA 1: nessuna identita ============ -->
-    <section id="screen-setup" class="screen" hidden>
+    <!-- ============ SCHERMATA: ingresso (nessuna identita) ============ -->
+    <section id="screen-welcome" class="screen">
       <div class="card">
-        <h2>Crea la tua identita</h2>
+        <h2>Benvenuto in Sigillo</h2>
         <p>
-          Questa identita ti serve per cifrare e decifrare i messaggi. Non serve
-          un'email, non serve una password su un server: tutto resta su questo
-          dispositivo.
+          Scrivi messaggi che solo il destinatario puo leggere. Non serve
+          un'email, non serve una password su un server: tutto resta su
+          questo dispositivo.
         </p>
+
+        <div class="button-row stacked">
+          <button id="btn-go-create" class="primary">Crea una nuova identita</button>
+          <button id="btn-go-import" class="secondary">Ho gia un'identita</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ SCHERMATA: crea nuova identita ============ -->
+    <section id="screen-create-name" class="screen">
+      <div class="card">
+        <button class="link-back" data-back-to="screen-welcome">← Indietro</button>
+        <h2>Crea la tua identita</h2>
 
         <label for="display-name">Come vuoi chiamarti? (visibile solo ai tuoi contatti)</label>
         <input id="display-name" type="text" placeholder="Es. Michele" />
@@ -71,22 +84,37 @@
           <label><input type="radio" name="word-count" value="24" /> 24 parole (piu sicuro)</label>
         </div>
 
-        <button id="btn-generate" class="primary">Genera nuova identita</button>
-
-        <hr />
-
-        <details>
-          <summary>Ho gia un'identita Sigillo (reinserisci la tua seed phrase)</summary>
-          <textarea id="import-phrase" rows="3" placeholder="Scrivi qui le 12 o 24 parole, separate da spazi"></textarea>
-          <button id="btn-import" class="secondary">Ripristina identita</button>
-        </details>
+        <div class="button-row">
+          <button id="btn-generate" class="primary">Genera</button>
+        </div>
 
         <p id="setup-error" class="error" hidden></p>
       </div>
     </section>
 
+    <!-- ============ SCHERMATA: ho gia un'identita ============ -->
+    <section id="screen-import" class="screen">
+      <div class="card">
+        <button class="link-back" data-back-to="screen-welcome">← Indietro</button>
+        <h2>Ripristina la tua identita</h2>
+        <p>Scrivi o incolla la tua seed phrase (12 o 24 parole, separate da spazi).</p>
+
+        <label for="import-display-name">Come vuoi chiamarti? (visibile solo ai tuoi contatti)</label>
+        <input id="import-display-name" type="text" placeholder="Es. Michele" />
+
+        <label for="import-phrase">Seed phrase</label>
+        <textarea id="import-phrase" rows="3" placeholder="Scrivi qui le 12 o 24 parole, separate da spazi"></textarea>
+
+        <div class="button-row">
+          <button id="btn-import" class="primary">Ripristina identita</button>
+        </div>
+
+        <p id="import-error" class="error" hidden></p>
+      </div>
+    </section>
+
     <!-- ============ SCHERMATA 2: conferma seed phrase ============ -->
-    <section id="screen-seed" class="screen" hidden>
+    <section id="screen-seed" class="screen">
       <div class="card">
         <h2>Scrivi questa frase su carta</h2>
         <p class="warning">
@@ -102,7 +130,7 @@
     </section>
 
     <!-- ============ SCHERMATA 3: conferma di aver scritto la seed ============ -->
-    <section id="screen-confirm" class="screen" hidden>
+    <section id="screen-confirm" class="screen">
       <div class="card">
         <h2>Verifica</h2>
         <p>Per essere sicuri che tu l'abbia scritta bene, riscrivi qui le parole richieste.</p>
@@ -115,7 +143,7 @@
     </section>
 
     <!-- ============ SCHERMATA: imposta la passphrase locale ============ -->
-    <section id="screen-set-passphrase" class="screen" hidden>
+    <section id="screen-set-passphrase" class="screen">
       <div class="card">
         <h2>Proteggi questo dispositivo</h2>
         <p>
@@ -140,7 +168,7 @@
     </section>
 
     <!-- ============ SCHERMATA 4: app principale ============ -->
-    <section id="screen-main" class="screen" hidden>
+    <section id="screen-main" class="screen">
       <nav class="tabs">
         <button class="tab-btn active" data-tab="tab-write">Scrivi</button>
         <button class="tab-btn" data-tab="tab-decrypt">Decifra</button>
@@ -241,7 +269,7 @@
     </section>
 
     <!-- ============ SCHERMATA: avanzate ============ -->
-    <section id="screen-advanced" class="screen" hidden>
+    <section id="screen-advanced" class="screen">
       <div class="button-row advanced-top">
         <button id="btn-close-advanced" class="secondary">← Torna all'app</button>
       </div>

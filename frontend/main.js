@@ -7,12 +7,40 @@ const { writeText } = window.__TAURI__.clipboardManager;
 const contacts = [];
 let currentIdentity = null;
 let pendingSeedWords = [];
-/** Flusso in corso nel wizard: "generate" (mostra/conferma seed) o "import" (salta direttamente alla passphrase). */
-let pendingFlow = null;
 
-function show(id) {
+// ---------- Stato applicativo: una sola vista visibile alla volta ----------
+//
+// setView() e l'UNICO modo per cambiare schermata: aggiunge/rimuove la
+// classe "active" (mai display:none via l'attributo hidden, vedi il
+// commento in styles.css sul perche). Ogni bottone che fa avanzare il
+// flusso chiama setView con l'id della vista successiva; nessuna vista e
+// mai raggiungibile per scroll.
+
+function setView(id) {
   for (const el of document.querySelectorAll(".screen")) {
-    el.hidden = el.id !== id;
+    el.classList.toggle("active", el.id === id);
+  }
+}
+
+document.querySelectorAll(".link-back").forEach((btn) => {
+  btn.addEventListener("click", () => setView(btn.dataset.backTo));
+});
+
+/**
+ * Esegue `action` (una funzione async) mostrando uno stato di caricamento
+ * sul bottone che l'ha attivata: disabilita il bottone e ci mette sopra
+ * uno spinner finche' la chiamata non e' finita, cosi ogni azione asincrona
+ * (generare chiavi, cifrare, sbloccare...) da un feedback immediato invece
+ * di sembrare "morta" per uno o due secondi.
+ */
+async function withLoading(button, action) {
+  button.disabled = true;
+  button.classList.add("is-loading");
+  try {
+    return await action();
+  } finally {
+    button.disabled = false;
+    button.classList.remove("is-loading");
   }
 }
 
@@ -110,11 +138,11 @@ function renderContactList() {
 function resetAppToFirstRunState() {
   currentIdentity = null;
   pendingSeedWords = [];
-  pendingFlow = null;
   contacts.length = 0;
   renderContactList();
   document.getElementById("btn-open-advanced").hidden = true;
   document.getElementById("display-name").value = "";
+  document.getElementById("import-display-name").value = "";
   document.getElementById("import-phrase").value = "";
   document.getElementById("my-public-key").value = "";
   document.getElementById("ciphertext-in").value = "";
@@ -127,29 +155,41 @@ function resetAppToFirstRunState() {
 async function init() {
   try {
     const exists = await invoke("identity_exists_on_disk");
-    show(exists ? "screen-unlock" : "screen-setup");
+    setView(exists ? "screen-unlock" : "screen-welcome");
   } catch (err) {
     // Se per qualche motivo non riusciamo a controllare, non blocchiamo
-    // l'utente: mostriamo comunque il wizard di partenza.
-    show("screen-setup");
+    // l'utente: mostriamo comunque la schermata di ingresso.
+    setView("screen-welcome");
   }
 }
 
+// ---------- Schermata: ingresso ----------
+
+document.getElementById("btn-go-create").addEventListener("click", () => {
+  setView("screen-create-name");
+});
+
+document.getElementById("btn-go-import").addEventListener("click", () => {
+  setView("screen-import");
+});
+
 // ---------- Schermata: sblocco ----------
 
-document.getElementById("btn-unlock").addEventListener("click", async () => {
+document.getElementById("btn-unlock").addEventListener("click", async (e) => {
   setError("unlock-error", null);
   const passphrase = document.getElementById("unlock-passphrase").value;
   try {
-    const view = await invoke("unlock_identity", { passphrase });
+    const view = await withLoading(e.currentTarget, () =>
+      invoke("unlock_identity", { passphrase })
+    );
     renderIdentity(view);
-    show("screen-main");
+    setView("screen-main");
   } catch (err) {
     setError("unlock-error", String(err));
   }
 });
 
-document.getElementById("btn-forgot-remove").addEventListener("click", async () => {
+document.getElementById("btn-forgot-remove").addEventListener("click", async (e) => {
   setError("forgot-error", null);
   const confirmText = document.getElementById("forgot-confirm-text").value.trim();
   if (confirmText !== "RIMUOVI") {
@@ -157,66 +197,67 @@ document.getElementById("btn-forgot-remove").addEventListener("click", async () 
     return;
   }
   try {
-    await invoke("remove_identity_from_disk");
+    await withLoading(e.currentTarget, () => invoke("remove_identity_from_disk"));
     resetAppToFirstRunState();
     document.getElementById("forgot-confirm-text").value = "";
-    show("screen-setup");
+    setView("screen-welcome");
   } catch (err) {
     setError("forgot-error", String(err));
   }
 });
 
-// ---------- Schermata 1: creazione/import identita ----------
+// ---------- Schermata: crea nuova identita ----------
 
-document.getElementById("btn-generate").addEventListener("click", async () => {
+document.getElementById("btn-generate").addEventListener("click", async (e) => {
   setError("setup-error", null);
   const displayName = document.getElementById("display-name").value;
   const wordCount = Number(
     document.querySelector('input[name="word-count"]:checked').value
   );
   try {
-    const view = await invoke("generate_identity", {
-      wordCount,
-      displayName,
-    });
+    const view = await withLoading(e.currentTarget, () =>
+      invoke("generate_identity", { wordCount, displayName })
+    );
     renderIdentity(view);
-    pendingFlow = "generate";
     pendingSeedWords = view.seed_words;
     renderSeedGrid(pendingSeedWords);
-    show("screen-seed");
+    setView("screen-seed");
   } catch (err) {
     setError("setup-error", String(err));
   }
 });
 
-document.getElementById("btn-import").addEventListener("click", async () => {
-  setError("setup-error", null);
-  const displayName = document.getElementById("display-name").value;
+// ---------- Schermata: ho gia un'identita (import) ----------
+
+document.getElementById("btn-import").addEventListener("click", async (e) => {
+  setError("import-error", null);
+  const displayName = document.getElementById("import-display-name").value;
   const phrase = document.getElementById("import-phrase").value;
   try {
-    const view = await invoke("import_identity", { phrase, displayName });
+    const view = await withLoading(e.currentTarget, () =>
+      invoke("import_identity", { phrase, displayName })
+    );
     renderIdentity(view);
-    pendingFlow = "import";
     // Chi reinserisce una seed phrase la conosce gia: non c'e bisogno di
     // rimostrarla/confermarla, si passa direttamente a proteggere questo
     // dispositivo con una passphrase locale.
-    show("screen-set-passphrase");
+    setView("screen-set-passphrase");
   } catch (err) {
-    setError("setup-error", String(err));
+    setError("import-error", String(err));
   }
 });
 
-// ---------- Schermata 2: mostra seed phrase ----------
+// ---------- Schermata: mostra seed phrase ----------
 
 document.getElementById("btn-seed-written").addEventListener("click", () => {
   const positions = pickConfirmationPositions(pendingSeedWords.length);
   renderConfirmFields(positions);
-  show("screen-confirm");
+  setView("screen-confirm");
 });
 
-// ---------- Schermata 3: conferma seed phrase ----------
+// ---------- Schermata: conferma seed phrase ----------
 
-document.getElementById("btn-confirm-check").addEventListener("click", async () => {
+document.getElementById("btn-confirm-check").addEventListener("click", async (e) => {
   setError("confirm-error", null);
   const inputs = [...document.querySelectorAll("#confirm-fields input")];
   const positionsAndWords = inputs.map((input) => [
@@ -224,9 +265,11 @@ document.getElementById("btn-confirm-check").addEventListener("click", async () 
     input.value,
   ]);
   try {
-    const ok = await invoke("confirm_seed_words", { positionsAndWords });
+    const ok = await withLoading(e.currentTarget, () =>
+      invoke("confirm_seed_words", { positionsAndWords })
+    );
     if (ok) {
-      show("screen-set-passphrase");
+      setView("screen-set-passphrase");
     } else {
       document.getElementById("confirm-error").hidden = false;
     }
@@ -237,7 +280,7 @@ document.getElementById("btn-confirm-check").addEventListener("click", async () 
 
 // ---------- Schermata: imposta la passphrase locale ----------
 
-document.getElementById("btn-save-passphrase").addEventListener("click", async () => {
+document.getElementById("btn-save-passphrase").addEventListener("click", async (e) => {
   setError("set-passphrase-error", null);
   const passphrase = document.getElementById("set-passphrase").value;
   const confirmPassphrase = document.getElementById("set-passphrase-confirm").value;
@@ -252,16 +295,18 @@ document.getElementById("btn-save-passphrase").addEventListener("click", async (
   }
 
   try {
-    await invoke("save_identity_to_disk", { passphrase });
+    await withLoading(e.currentTarget, () =>
+      invoke("save_identity_to_disk", { passphrase })
+    );
     document.getElementById("set-passphrase").value = "";
     document.getElementById("set-passphrase-confirm").value = "";
-    show("screen-main");
+    setView("screen-main");
   } catch (err) {
     setError("set-passphrase-error", String(err));
   }
 });
 
-// ---------- Tabs ----------
+// ---------- Tabs (sezioni della app operativa) ----------
 
 for (const btn of document.querySelectorAll(".tab-btn")) {
   btn.addEventListener("click", () => {
@@ -274,7 +319,7 @@ for (const btn of document.querySelectorAll(".tab-btn")) {
 
 // ---------- Rubrica ----------
 
-document.getElementById("btn-add-contact").addEventListener("click", async () => {
+document.getElementById("btn-add-contact").addEventListener("click", async (e) => {
   setError("contact-error", null);
   const name = document.getElementById("contact-name").value.trim();
   const key = document.getElementById("contact-key").value.trim();
@@ -283,9 +328,9 @@ document.getElementById("btn-add-contact").addEventListener("click", async () =>
     return;
   }
   try {
-    const fp = await invoke("contact_fingerprint_words", {
-      armoredPublicKey: key,
-    });
+    const fp = await withLoading(e.currentTarget, () =>
+      invoke("contact_fingerprint_words", { armoredPublicKey: key })
+    );
     contacts.push({
       name,
       key,
@@ -302,7 +347,7 @@ document.getElementById("btn-add-contact").addEventListener("click", async () =>
 
 // ---------- Scrivi / cifra ----------
 
-document.getElementById("btn-encrypt").addEventListener("click", async () => {
+document.getElementById("btn-encrypt").addEventListener("click", async (e) => {
   setError("encrypt-error", null);
   document.getElementById("encrypt-result").hidden = true;
 
@@ -321,11 +366,9 @@ document.getElementById("btn-encrypt").addEventListener("click", async () => {
   }
 
   try {
-    const ciphertext = await invoke("encrypt_message", {
-      recipientsArmored: selected,
-      plaintext,
-      sign,
-    });
+    const ciphertext = await withLoading(e.currentTarget, () =>
+      invoke("encrypt_message", { recipientsArmored: selected, plaintext, sign })
+    );
     document.getElementById("ciphertext-out").value = ciphertext;
     document.getElementById("encrypt-result").hidden = false;
   } catch (err) {
@@ -360,7 +403,7 @@ document.getElementById("btn-load-file").addEventListener("click", async () => {
   }
 });
 
-document.getElementById("btn-decrypt").addEventListener("click", async () => {
+document.getElementById("btn-decrypt").addEventListener("click", async (e) => {
   setError("decrypt-error", null);
   document.getElementById("decrypt-result").hidden = true;
 
@@ -371,10 +414,9 @@ document.getElementById("btn-decrypt").addEventListener("click", async () => {
   }
 
   try {
-    const result = await invoke("decrypt_message", {
-      contactsArmored: contacts.map((c) => c.key),
-      ciphertext,
-    });
+    const result = await withLoading(e.currentTarget, () =>
+      invoke("decrypt_message", { contactsArmored: contacts.map((c) => c.key), ciphertext })
+    );
     document.getElementById("plaintext-out").value = result.plaintext;
 
     const statusEl = document.getElementById("signature-status");
@@ -471,36 +513,32 @@ async function populateAdvancedScreen() {
     techContainer.className = "tech-details";
     details.appendChild(techContainer);
 
-    details.addEventListener(
-      "toggle",
-      async () => {
-        if (!details.open || techContainer.childElementCount > 0) return;
-        try {
-          const keyDetails = await invoke("contact_technical_details", {
-            armoredPublicKey: contact.key,
-          });
-          for (const d of keyDetails) renderTechDetail(techContainer, d);
-        } catch (err) {
-          techContainer.innerHTML = `<p class="error">${String(err)}</p>`;
-        }
-      },
-      { once: false }
-    );
+    details.addEventListener("toggle", async () => {
+      if (!details.open || techContainer.childElementCount > 0) return;
+      try {
+        const keyDetails = await invoke("contact_technical_details", {
+          armoredPublicKey: contact.key,
+        });
+        for (const d of keyDetails) renderTechDetail(techContainer, d);
+      } catch (err) {
+        techContainer.innerHTML = `<p class="error">${String(err)}</p>`;
+      }
+    });
 
     contactsContainer.appendChild(details);
   }
 }
 
-document.getElementById("btn-open-advanced").addEventListener("click", async () => {
-  await populateAdvancedScreen();
-  show("screen-advanced");
+document.getElementById("btn-open-advanced").addEventListener("click", async (e) => {
+  await withLoading(e.currentTarget, () => populateAdvancedScreen());
+  setView("screen-advanced");
 });
 
 document.getElementById("btn-close-advanced").addEventListener("click", () => {
-  show("screen-main");
+  setView("screen-main");
 });
 
-document.getElementById("btn-export-tsk").addEventListener("click", async () => {
+document.getElementById("btn-export-tsk").addEventListener("click", async (e) => {
   setError("export-tsk-error", null);
   const password = document.getElementById("export-tsk-password").value;
   if (!password) {
@@ -508,7 +546,9 @@ document.getElementById("btn-export-tsk").addEventListener("click", async () => 
     return;
   }
   try {
-    const armored = await invoke("export_private_key_file", { password });
+    const armored = await withLoading(e.currentTarget, () =>
+      invoke("export_private_key_file", { password })
+    );
     const path = await save({
       defaultPath: "sigillo-chiave-privata.asc",
       filters: [{ name: "Chiave privata OpenPGP", extensions: ["asc"] }],
@@ -522,7 +562,7 @@ document.getElementById("btn-export-tsk").addEventListener("click", async () => 
   }
 });
 
-document.getElementById("btn-remove-identity").addEventListener("click", async () => {
+document.getElementById("btn-remove-identity").addEventListener("click", async (e) => {
   setError("remove-error", null);
   const confirmText = document.getElementById("remove-confirm-text").value.trim();
   if (confirmText !== "RIMUOVI") {
@@ -530,10 +570,10 @@ document.getElementById("btn-remove-identity").addEventListener("click", async (
     return;
   }
   try {
-    await invoke("remove_identity_from_disk");
+    await withLoading(e.currentTarget, () => invoke("remove_identity_from_disk"));
     resetAppToFirstRunState();
     document.getElementById("remove-confirm-text").value = "";
-    show("screen-setup");
+    setView("screen-welcome");
   } catch (err) {
     setError("remove-error", String(err));
   }
