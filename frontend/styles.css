@@ -10,6 +10,8 @@
   --warning-bg: #fff3cd;
   --warning-fg: #6b4d00;
   --muted: #6b6558;
+  --danger: #a33a2f;
+  --danger-fg: #ffffff;
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
 }
 
@@ -24,6 +26,8 @@
     --warning-bg: #3a2f00;
     --warning-fg: #f5d97a;
     --muted: #9a9587;
+    --danger: #c0564a;
+    --danger-fg: #1a0d0b;
   }
 }
 
@@ -40,6 +44,14 @@ body {
 
 .app-header {
   padding: 1.5rem 2rem 0.5rem;
+}
+
+.header-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  gap: 1rem;
+  position: relative;
   text-align: center;
 }
 
@@ -52,6 +64,20 @@ body {
 .tagline {
   color: var(--muted);
   margin-top: 0.25rem;
+}
+
+.gear-btn {
+  position: absolute;
+  right: 0;
+  top: 0;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  width: 2.4rem;
+  height: 2.4rem;
+  padding: 0;
+  font-size: 1.1rem;
+  line-height: 1;
 }
 
 .screen {
@@ -135,6 +161,12 @@ button.secondary {
   background: transparent;
   border-color: var(--border);
   color: var(--fg);
+}
+
+button.danger {
+  background: var(--danger);
+  color: var(--danger-fg);
+  margin-top: 0.75rem;
 }
 
 .button-row {
@@ -299,5 +331,58 @@ details summary {
 
 .signature-status.unsigned {
   background: var(--bg);
+  color: var(--muted);
+}
+
+.advanced-top {
+  max-width: 640px;
+  margin: 0 auto 0.5rem;
+  width: 100%;
+  padding: 0 1.5rem;
+}
+
+.tech-details {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  margin: 0.75rem 0;
+}
+
+.tech-key {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.65rem 0.8rem;
+  font-size: 0.85rem;
+}
+
+.tech-key .tech-label {
+  font-weight: 600;
+  display: block;
+  margin-bottom: 0.15rem;
+}
+
+.tech-key .tech-line {
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  display: block;
+}
+
+.tech-contact {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.65rem 0.8rem;
+}
+
+.tech-contact summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.forgot-passphrase {
+  margin-top: 1.5rem;
+}
+
+.forgot-passphrase summary {
   color: var(--muted);
 }

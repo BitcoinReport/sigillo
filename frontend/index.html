@@ -8,12 +8,53 @@
   </head>
   <body>
     <header class="app-header">
-      <h1>Sigillo</h1>
-      <p class="tagline">Scrivi, cifra, condividi. Nessuno tranne il destinatario puo leggere.</p>
+      <div class="header-row">
+        <div>
+          <h1>Sigillo</h1>
+          <p class="tagline">Scrivi, cifra, condividi. Nessuno tranne il destinatario puo leggere.</p>
+        </div>
+        <button id="btn-open-advanced" class="gear-btn" title="Avanzate" hidden>⚙</button>
+      </div>
     </header>
 
+    <!-- ============ SCHERMATA: caricamento iniziale ============ -->
+    <section id="screen-loading" class="screen">
+      <div class="card"><p class="hint">Caricamento...</p></div>
+    </section>
+
+    <!-- ============ SCHERMATA: sblocco (identita gia presente su questo dispositivo) ============ -->
+    <section id="screen-unlock" class="screen" hidden>
+      <div class="card">
+        <h2>Bentornato</h2>
+        <p>Questo dispositivo ha gia un'identita Sigillo. Inserisci la passphrase che avevi scelto per sbloccarla.</p>
+
+        <label for="unlock-passphrase">Passphrase</label>
+        <input id="unlock-passphrase" type="password" placeholder="La tua passphrase" />
+
+        <div class="button-row">
+          <button id="btn-unlock" class="primary">Sblocca</button>
+        </div>
+        <p id="unlock-error" class="error" hidden></p>
+
+        <details class="forgot-passphrase">
+          <summary>Ho dimenticato la passphrase</summary>
+          <p class="warning">
+            Non c'e modo di recuperare la passphrase. Puoi pero rimuovere
+            l'identita salvata su questo dispositivo e reimportarla con la
+            tua seed phrase (le 12 o 24 parole originali). Se non hai piu
+            neanche quella, l'identita e persa per sempre: e per questo che
+            va scritta su carta.
+          </p>
+          <label for="forgot-confirm-text">Scrivi RIMUOVI per confermare</label>
+          <input id="forgot-confirm-text" type="text" placeholder="RIMUOVI" />
+          <button id="btn-forgot-remove" class="danger">Rimuovi identita da questo dispositivo</button>
+          <p id="forgot-error" class="error" hidden></p>
+        </details>
+      </div>
+    </section>
+
     <!-- ============ SCHERMATA 1: nessuna identita ============ -->
-    <section id="screen-setup" class="screen">
+    <section id="screen-setup" class="screen" hidden>
       <div class="card">
         <h2>Crea la tua identita</h2>
         <p>
@@ -70,6 +111,31 @@
 
         <button id="btn-confirm-check" class="primary">Verifica e continua</button>
         <p id="confirm-error" class="error" hidden>Una o piu parole non corrispondono. Controlla i tuoi appunti.</p>
+      </div>
+    </section>
+
+    <!-- ============ SCHERMATA: imposta la passphrase locale ============ -->
+    <section id="screen-set-passphrase" class="screen" hidden>
+      <div class="card">
+        <h2>Proteggi questo dispositivo</h2>
+        <p>
+          Scegli una passphrase per sbloccare Sigillo su <em>questo</em>
+          computer. Non e la tua seed phrase (quella serve solo per
+          reimportare l'identita su un altro dispositivo, o se rimuovi
+          l'identita da qui): la passphrase resta locale e la puoi
+          cambiare quando vuoi rimuovendo e reimportando l'identita.
+        </p>
+
+        <label for="set-passphrase">Passphrase (almeno 8 caratteri)</label>
+        <input id="set-passphrase" type="password" placeholder="Scegli una passphrase" />
+
+        <label for="set-passphrase-confirm">Ripeti la passphrase</label>
+        <input id="set-passphrase-confirm" type="password" placeholder="Ripeti la passphrase" />
+
+        <div class="button-row">
+          <button id="btn-save-passphrase" class="primary">Salva e continua</button>
+        </div>
+        <p id="set-passphrase-error" class="error" hidden></p>
       </div>
     </section>
 
@@ -164,7 +230,6 @@
 
           <label>Impronta (fingerprint) — leggila a voce a un contatto per verificarla</label>
           <p id="my-fingerprint-words" class="fingerprint-words"></p>
-          <p id="my-fingerprint-hex" class="fingerprint-hex"></p>
 
           <label for="my-public-key">La tua chiave pubblica (condividila con chi vuole scriverti)</label>
           <textarea id="my-public-key" rows="10" readonly></textarea>
@@ -172,6 +237,63 @@
             <button id="btn-copy-pubkey" class="secondary">Copia</button>
           </div>
         </div>
+      </div>
+    </section>
+
+    <!-- ============ SCHERMATA: avanzate ============ -->
+    <section id="screen-advanced" class="screen" hidden>
+      <div class="button-row advanced-top">
+        <button id="btn-close-advanced" class="secondary">← Torna all'app</button>
+      </div>
+
+      <div class="card">
+        <h2>Avanzate</h2>
+        <p class="hint">
+          Questa sezione contiene informazioni tecniche, utili solo se sai
+          gia cosa significano. Il resto dell'app non ne ha bisogno.
+        </p>
+
+        <h3>La mia chiave</h3>
+        <label>Fingerprint completo (esadecimale)</label>
+        <p id="adv-my-fingerprint-hex" class="fingerprint-hex"></p>
+        <div id="adv-my-details" class="tech-details"></div>
+
+        <hr />
+
+        <h3>Contatti in rubrica</h3>
+        <div id="adv-contacts" class="tech-details"></div>
+
+        <hr />
+
+        <h3>Esporta la chiave privata come file</h3>
+        <p class="warning">
+          Meno consigliato della seed phrase: un file digitale puo essere
+          copiato, sincronizzato per errore su un cloud, o rubato da un
+          malware. Se puoi, preferisci sempre la seed phrase scritta su
+          carta. Se esporti comunque questo file, resta cifrato con la
+          password che scegli qui sotto.
+        </p>
+        <label for="export-tsk-password">Password per il file esportato</label>
+        <input id="export-tsk-password" type="password" placeholder="Scegli una password" />
+        <div class="button-row">
+          <button id="btn-export-tsk" class="secondary">Esporta chiave privata...</button>
+        </div>
+        <p id="export-tsk-error" class="error" hidden></p>
+
+        <hr />
+
+        <h3>Rimuovi identita da questo computer</h3>
+        <p class="warning">
+          Sei sicuro? Dopo questa azione dovrai reimportare la tua identita
+          con la seed phrase per usarla di nuovo su questo dispositivo.
+          L'identita in se non va persa (resta valida ovunque tu abbia la
+          seed phrase), ma qui verra cancellata insieme alla passphrase
+          locale.
+        </p>
+        <label for="remove-confirm-text">Scrivi RIMUOVI per confermare</label>
+        <input id="remove-confirm-text" type="text" placeholder="RIMUOVI" />
+        <button id="btn-remove-identity" class="danger">Rimuovi identita da questo computer</button>
+        <p id="remove-error" class="error" hidden></p>
       </div>
     </section>
 

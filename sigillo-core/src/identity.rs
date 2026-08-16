@@ -173,9 +173,52 @@ pub fn import(phrase: &str, display_name: &str) -> Result<Identity> {
     from_mnemonic(mnemonic, display_name)
 }
 
+/// Esporta la chiave privata come file OpenPGP classico (ASCII armored),
+/// cifrata con una password: l'alternativa "meno consigliata" alla seed
+/// phrase per chi preferisce comunque un file. Meno consigliata perche un
+/// file digitale e una superficie di attacco in piu rispetto a una frase
+/// scritta su carta (puo essere copiato, sincronizzato per errore su un
+/// cloud, rubato da un malware) - per questo richiede comunque una
+/// password che lo protegge se qualcuno mette le mani sul file.
+pub fn export_private_key_file(cert: &Cert, password: &str) -> Result<String> {
+    if password.is_empty() {
+        anyhow::bail!("la password del file esportato non puo essere vuota");
+    }
+    let password: openpgp::crypto::Password = password.to_owned().into();
+
+    let packets: Vec<openpgp::Packet> = cert
+        .clone()
+        .into_tsk()
+        .into_packets()
+        .map(|packet| match packet {
+            openpgp::Packet::SecretKey(mut key) => {
+                key.secret_mut()
+                    .encrypt_in_place(&password)
+                    .context("errore interno durante la protezione della chiave primaria")?;
+                Ok(openpgp::Packet::SecretKey(key))
+            }
+            openpgp::Packet::SecretSubkey(mut key) => {
+                key.secret_mut()
+                    .encrypt_in_place(&password)
+                    .context("errore interno durante la protezione della sottochiave")?;
+                Ok(openpgp::Packet::SecretSubkey(key))
+            }
+            other => Ok(other),
+        })
+        .collect::<Result<_>>()?;
+
+    let protected_cert = Cert::try_from(packets)
+        .context("errore interno durante la protezione della chiave privata")?;
+
+    let armored = openpgp::serialize::SerializeInto::to_vec(&protected_cert.as_tsk().armored())
+        .context("errore interno durante l'esportazione della chiave privata")?;
+    String::from_utf8(armored).context("errore interno: chiave esportata non valida")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openpgp::parse::Parse;
 
     #[test]
     fn generate_produces_12_and_24_words() {
@@ -219,5 +262,31 @@ mod tests {
     #[test]
     fn rejects_garbage_seed_phrase() {
         assert!(import("questa non e una seed phrase valida", "Test").is_err());
+    }
+
+    #[test]
+    fn export_private_key_file_is_password_protected_tsk() {
+        let id = generate(SeedWordCount::Twelve, "Alice").unwrap();
+        let exported = export_private_key_file(&id.cert, "una password robusta").unwrap();
+
+        assert!(exported.starts_with("-----BEGIN PGP PRIVATE KEY BLOCK-----"));
+
+        let reparsed = Cert::from_bytes(exported.as_bytes()).unwrap();
+        assert_eq!(reparsed.fingerprint(), id.cert.fingerprint());
+
+        // Il materiale segreto nel file esportato deve essere cifrato:
+        // non deve essere possibile usarlo senza prima sbloccarlo con la password.
+        let primary_secret = reparsed
+            .keys()
+            .secret()
+            .next()
+            .expect("il file esportato deve contenere materiale segreto");
+        assert!(primary_secret.key().secret().is_encrypted());
+    }
+
+    #[test]
+    fn export_private_key_file_rejects_empty_password() {
+        let id = generate(SeedWordCount::Twelve, "Alice").unwrap();
+        assert!(export_private_key_file(&id.cert, "").is_err());
     }
 }

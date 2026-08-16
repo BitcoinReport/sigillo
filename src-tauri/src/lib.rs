@@ -1,13 +1,26 @@
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 use serde::Serialize;
-use tauri::State;
+use tauri::{AppHandle, Manager, State};
 
-use sigillo_core::{contacts, identity, message};
+use sigillo_core::{contacts, identity, keyinfo, message, storage};
+
+const VAULT_FILE_NAME: &str = "identity.sigillo";
+const MIN_PASSPHRASE_LEN: usize = 8;
 
 #[derive(Default)]
 struct AppState {
     identity: Mutex<Option<identity::Identity>>,
+    display_name: Mutex<Option<String>>,
+}
+
+fn vault_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("impossibile trovare la cartella dati dell'app: {e}"))?;
+    Ok(dir.join(VAULT_FILE_NAME))
 }
 
 #[derive(Serialize)]
@@ -40,6 +53,19 @@ fn identity_view(id: &identity::Identity, display_name: &str) -> Result<Identity
     })
 }
 
+fn set_current_identity(state: &State<AppState>, id: identity::Identity, display_name: &str) {
+    *state.identity.lock().unwrap() = Some(id);
+    *state.display_name.lock().unwrap() = Some(display_name.to_string());
+}
+
+/// Vero se su questo dispositivo esiste gia un'identita salvata: decide se
+/// l'app deve mostrare il wizard di generazione/import (primo avvio) o la
+/// schermata di sblocco con la sola passphrase (avvii successivi).
+#[tauri::command]
+fn identity_exists_on_disk(app: AppHandle) -> Result<bool, String> {
+    Ok(storage::vault_exists(&vault_path(&app)?))
+}
+
 #[tauri::command]
 fn generate_identity(
     state: State<AppState>,
@@ -60,7 +86,7 @@ fn generate_identity(
 
     let id = identity::generate(words, name).map_err(|e| e.to_string())?;
     let view = identity_view(&id, name)?;
-    *state.identity.lock().unwrap() = Some(id);
+    set_current_identity(&state, id, name);
     Ok(view)
 }
 
@@ -78,14 +104,17 @@ fn import_identity(
 
     let id = identity::import(&phrase, name).map_err(|e| e.to_string())?;
     let view = identity_view(&id, name)?;
-    *state.identity.lock().unwrap() = Some(id);
+    set_current_identity(&state, id, name);
     Ok(view)
 }
 
 /// Ricontrolla che le parole indicate della seed phrase corrispondano a
 /// quelle mostrate, come nel wizard di conferma dei wallet Bitcoin.
 #[tauri::command]
-fn confirm_seed_words(state: State<AppState>, positions_and_words: Vec<(u32, String)>) -> Result<bool, String> {
+fn confirm_seed_words(
+    state: State<AppState>,
+    positions_and_words: Vec<(u32, String)>,
+) -> Result<bool, String> {
     let guard = state.identity.lock().unwrap();
     let id = guard.as_ref().ok_or("nessuna identita generata")?;
     let words = id.seed_words();
@@ -99,6 +128,61 @@ fn confirm_seed_words(state: State<AppState>, positions_and_words: Vec<(u32, Str
         }
     }
     Ok(true)
+}
+
+/// Salva su disco, cifrata con `passphrase`, l'identita attualmente in
+/// memoria (generata o importata in questa sessione). Da chiamare come
+/// ultimo passo del wizard di primo avvio.
+#[tauri::command]
+fn save_identity_to_disk(
+    app: AppHandle,
+    state: State<AppState>,
+    passphrase: String,
+) -> Result<(), String> {
+    if passphrase.len() < MIN_PASSPHRASE_LEN {
+        return Err(format!(
+            "la passphrase deve avere almeno {MIN_PASSPHRASE_LEN} caratteri"
+        ));
+    }
+
+    let guard = state.identity.lock().unwrap();
+    let id = guard.as_ref().ok_or("nessuna identita da salvare")?;
+    let name_guard = state.display_name.lock().unwrap();
+    let display_name = name_guard.as_deref().unwrap_or("Io");
+
+    let path = vault_path(&app)?;
+    storage::save_identity(&path, &passphrase, display_name, &id.seed_phrase())
+        .map_err(|e| e.to_string())
+}
+
+/// Sblocca, con la sola passphrase locale (non la seed phrase), l'identita
+/// gia salvata su questo dispositivo.
+#[tauri::command]
+fn unlock_identity(
+    app: AppHandle,
+    state: State<AppState>,
+    passphrase: String,
+) -> Result<IdentityView, String> {
+    let path = vault_path(&app)?;
+    let (display_name, seed_phrase) =
+        storage::load_identity(&path, &passphrase).map_err(|e| e.to_string())?;
+
+    let id = identity::import(&seed_phrase, &display_name).map_err(|e| e.to_string())?;
+    let view = identity_view(&id, &display_name)?;
+    set_current_identity(&state, id, &display_name);
+    Ok(view)
+}
+
+/// Rimuove in modo sicuro l'identita salvata su questo dispositivo. Dopo
+/// questa chiamata il prossimo avvio torna a mostrare il wizard di
+/// generazione/import, come al primo avvio.
+#[tauri::command]
+fn remove_identity_from_disk(app: AppHandle, state: State<AppState>) -> Result<(), String> {
+    let path = vault_path(&app)?;
+    storage::remove_identity(&path).map_err(|e| e.to_string())?;
+    *state.identity.lock().unwrap() = None;
+    *state.display_name.lock().unwrap() = None;
+    Ok(())
 }
 
 #[derive(Serialize)]
@@ -118,6 +202,56 @@ fn contact_fingerprint_words(armored_public_key: String) -> Result<ContactFinger
             .map(str::to_string)
             .collect(),
     })
+}
+
+#[derive(Serialize)]
+struct KeyDetailView {
+    label: String,
+    algorithm: String,
+    created_unix: i64,
+    expires_unix: Option<i64>,
+}
+
+impl From<keyinfo::KeyDetail> for KeyDetailView {
+    fn from(d: keyinfo::KeyDetail) -> Self {
+        KeyDetailView {
+            label: d.label,
+            algorithm: d.algorithm,
+            created_unix: d.created_unix,
+            expires_unix: d.expires_unix,
+        }
+    }
+}
+
+/// Dettagli tecnici (algoritmo, date) della propria identita, per la
+/// sezione "avanzate".
+#[tauri::command]
+fn my_technical_details(state: State<AppState>) -> Result<Vec<KeyDetailView>, String> {
+    let guard = state.identity.lock().unwrap();
+    let id = guard.as_ref().ok_or("genera o importa prima la tua identita")?;
+    keyinfo::technical_details(&id.cert)
+        .map(|details| details.into_iter().map(Into::into).collect())
+        .map_err(|e| e.to_string())
+}
+
+/// Dettagli tecnici (algoritmo, date) della chiave pubblica di un
+/// contatto, per la sezione "avanzate".
+#[tauri::command]
+fn contact_technical_details(armored_public_key: String) -> Result<Vec<KeyDetailView>, String> {
+    let cert =
+        contacts::import_public_key(armored_public_key.as_bytes()).map_err(|e| e.to_string())?;
+    keyinfo::technical_details(&cert)
+        .map(|details| details.into_iter().map(Into::into).collect())
+        .map_err(|e| e.to_string())
+}
+
+/// Esporta la chiave privata come file classico cifrato con password
+/// (l'alternativa "meno consigliata" alla seed phrase).
+#[tauri::command]
+fn export_private_key_file(state: State<AppState>, password: String) -> Result<String, String> {
+    let guard = state.identity.lock().unwrap();
+    let id = guard.as_ref().ok_or("genera o importa prima la tua identita")?;
+    identity::export_private_key_file(&id.cert, &password).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -192,10 +326,17 @@ pub fn run() {
         .plugin(tauri_plugin_clipboard_manager::init())
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
+            identity_exists_on_disk,
             generate_identity,
             import_identity,
             confirm_seed_words,
+            save_identity_to_disk,
+            unlock_identity,
+            remove_identity_from_disk,
             contact_fingerprint_words,
+            my_technical_details,
+            contact_technical_details,
+            export_private_key_file,
             encrypt_message,
             decrypt_message,
         ])

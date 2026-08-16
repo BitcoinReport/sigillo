@@ -7,6 +7,8 @@ const { writeText } = window.__TAURI__.clipboardManager;
 const contacts = [];
 let currentIdentity = null;
 let pendingSeedWords = [];
+/** Flusso in corso nel wizard: "generate" (mostra/conferma seed) o "import" (salta direttamente alla passphrase). */
+let pendingFlow = null;
 
 function show(id) {
   for (const el of document.querySelectorAll(".screen")) {
@@ -30,8 +32,8 @@ function renderIdentity(view) {
   document.getElementById("my-name").textContent = view.display_name;
   document.getElementById("my-fingerprint-words").textContent =
     view.fingerprint_words.join("  ");
-  document.getElementById("my-fingerprint-hex").textContent = view.fingerprint_hex;
   document.getElementById("my-public-key").value = view.public_key_armored;
+  document.getElementById("btn-open-advanced").hidden = false;
 }
 
 function renderSeedGrid(words) {
@@ -105,6 +107,65 @@ function renderContactList() {
   renderRecipientList();
 }
 
+function resetAppToFirstRunState() {
+  currentIdentity = null;
+  pendingSeedWords = [];
+  pendingFlow = null;
+  contacts.length = 0;
+  renderContactList();
+  document.getElementById("btn-open-advanced").hidden = true;
+  document.getElementById("display-name").value = "";
+  document.getElementById("import-phrase").value = "";
+  document.getElementById("my-public-key").value = "";
+  document.getElementById("ciphertext-in").value = "";
+  document.getElementById("ciphertext-out").value = "";
+  document.getElementById("message-text").value = "";
+}
+
+// ---------- Avvio: identita gia presente su questo dispositivo? ----------
+
+async function init() {
+  try {
+    const exists = await invoke("identity_exists_on_disk");
+    show(exists ? "screen-unlock" : "screen-setup");
+  } catch (err) {
+    // Se per qualche motivo non riusciamo a controllare, non blocchiamo
+    // l'utente: mostriamo comunque il wizard di partenza.
+    show("screen-setup");
+  }
+}
+
+// ---------- Schermata: sblocco ----------
+
+document.getElementById("btn-unlock").addEventListener("click", async () => {
+  setError("unlock-error", null);
+  const passphrase = document.getElementById("unlock-passphrase").value;
+  try {
+    const view = await invoke("unlock_identity", { passphrase });
+    renderIdentity(view);
+    show("screen-main");
+  } catch (err) {
+    setError("unlock-error", String(err));
+  }
+});
+
+document.getElementById("btn-forgot-remove").addEventListener("click", async () => {
+  setError("forgot-error", null);
+  const confirmText = document.getElementById("forgot-confirm-text").value.trim();
+  if (confirmText !== "RIMUOVI") {
+    setError("forgot-error", 'Scrivi esattamente "RIMUOVI" per confermare.');
+    return;
+  }
+  try {
+    await invoke("remove_identity_from_disk");
+    resetAppToFirstRunState();
+    document.getElementById("forgot-confirm-text").value = "";
+    show("screen-setup");
+  } catch (err) {
+    setError("forgot-error", String(err));
+  }
+});
+
 // ---------- Schermata 1: creazione/import identita ----------
 
 document.getElementById("btn-generate").addEventListener("click", async () => {
@@ -119,6 +180,7 @@ document.getElementById("btn-generate").addEventListener("click", async () => {
       displayName,
     });
     renderIdentity(view);
+    pendingFlow = "generate";
     pendingSeedWords = view.seed_words;
     renderSeedGrid(pendingSeedWords);
     show("screen-seed");
@@ -134,7 +196,11 @@ document.getElementById("btn-import").addEventListener("click", async () => {
   try {
     const view = await invoke("import_identity", { phrase, displayName });
     renderIdentity(view);
-    show("screen-main");
+    pendingFlow = "import";
+    // Chi reinserisce una seed phrase la conosce gia: non c'e bisogno di
+    // rimostrarla/confermarla, si passa direttamente a proteggere questo
+    // dispositivo con una passphrase locale.
+    show("screen-set-passphrase");
   } catch (err) {
     setError("setup-error", String(err));
   }
@@ -160,12 +226,38 @@ document.getElementById("btn-confirm-check").addEventListener("click", async () 
   try {
     const ok = await invoke("confirm_seed_words", { positionsAndWords });
     if (ok) {
-      show("screen-main");
+      show("screen-set-passphrase");
     } else {
       document.getElementById("confirm-error").hidden = false;
     }
   } catch (err) {
     setError("confirm-error", String(err));
+  }
+});
+
+// ---------- Schermata: imposta la passphrase locale ----------
+
+document.getElementById("btn-save-passphrase").addEventListener("click", async () => {
+  setError("set-passphrase-error", null);
+  const passphrase = document.getElementById("set-passphrase").value;
+  const confirmPassphrase = document.getElementById("set-passphrase-confirm").value;
+
+  if (passphrase.length < 8) {
+    setError("set-passphrase-error", "La passphrase deve avere almeno 8 caratteri.");
+    return;
+  }
+  if (passphrase !== confirmPassphrase) {
+    setError("set-passphrase-error", "Le due passphrase non coincidono.");
+    return;
+  }
+
+  try {
+    await invoke("save_identity_to_disk", { passphrase });
+    document.getElementById("set-passphrase").value = "";
+    document.getElementById("set-passphrase-confirm").value = "";
+    show("screen-main");
+  } catch (err) {
+    setError("set-passphrase-error", String(err));
   }
 });
 
@@ -314,4 +406,137 @@ document.getElementById("btn-copy-pubkey").addEventListener("click", async () =>
   await writeText(document.getElementById("my-public-key").value);
 });
 
-show("screen-setup");
+// ---------- Avanzate ----------
+
+function formatUnixDate(unixSeconds) {
+  return new Date(unixSeconds * 1000).toLocaleDateString("it-IT", {
+    year: "numeric",
+    month: "long",
+    day: "numeric",
+  });
+}
+
+function renderTechDetail(container, detail) {
+  const div = document.createElement("div");
+  div.className = "tech-key";
+  const expires = detail.expires_unix ? formatUnixDate(detail.expires_unix) : "mai";
+  const label = document.createElement("span");
+  label.className = "tech-label";
+  label.textContent = detail.label;
+  const algoLine = document.createElement("span");
+  algoLine.className = "tech-line";
+  algoLine.textContent = `Algoritmo: ${detail.algorithm}`;
+  const createdLine = document.createElement("span");
+  createdLine.className = "tech-line";
+  createdLine.textContent = `Creata il: ${formatUnixDate(detail.created_unix)}`;
+  const expiresLine = document.createElement("span");
+  expiresLine.className = "tech-line";
+  expiresLine.textContent = `Scadenza: ${expires}`;
+  div.append(label, algoLine, createdLine, expiresLine);
+  container.appendChild(div);
+}
+
+async function populateAdvancedScreen() {
+  document.getElementById("adv-my-fingerprint-hex").textContent =
+    currentIdentity ? currentIdentity.fingerprint_hex : "";
+
+  const myDetails = document.getElementById("adv-my-details");
+  myDetails.innerHTML = "";
+  try {
+    const details = await invoke("my_technical_details");
+    for (const d of details) renderTechDetail(myDetails, d);
+  } catch (err) {
+    myDetails.innerHTML = `<p class="error">${String(err)}</p>`;
+  }
+
+  const contactsContainer = document.getElementById("adv-contacts");
+  contactsContainer.innerHTML = "";
+  if (contacts.length === 0) {
+    contactsContainer.innerHTML = '<p class="hint">Nessun contatto in rubrica.</p>';
+    return;
+  }
+  for (const contact of contacts) {
+    const details = document.createElement("details");
+    details.className = "tech-contact";
+    const summary = document.createElement("summary");
+    summary.textContent = contact.name;
+    details.appendChild(summary);
+
+    const fp = document.createElement("p");
+    fp.className = "fingerprint-hex";
+    fp.textContent = contact.fingerprintHex;
+    details.appendChild(fp);
+
+    const techContainer = document.createElement("div");
+    techContainer.className = "tech-details";
+    details.appendChild(techContainer);
+
+    details.addEventListener(
+      "toggle",
+      async () => {
+        if (!details.open || techContainer.childElementCount > 0) return;
+        try {
+          const keyDetails = await invoke("contact_technical_details", {
+            armoredPublicKey: contact.key,
+          });
+          for (const d of keyDetails) renderTechDetail(techContainer, d);
+        } catch (err) {
+          techContainer.innerHTML = `<p class="error">${String(err)}</p>`;
+        }
+      },
+      { once: false }
+    );
+
+    contactsContainer.appendChild(details);
+  }
+}
+
+document.getElementById("btn-open-advanced").addEventListener("click", async () => {
+  await populateAdvancedScreen();
+  show("screen-advanced");
+});
+
+document.getElementById("btn-close-advanced").addEventListener("click", () => {
+  show("screen-main");
+});
+
+document.getElementById("btn-export-tsk").addEventListener("click", async () => {
+  setError("export-tsk-error", null);
+  const password = document.getElementById("export-tsk-password").value;
+  if (!password) {
+    setError("export-tsk-error", "Scegli una password per proteggere il file esportato.");
+    return;
+  }
+  try {
+    const armored = await invoke("export_private_key_file", { password });
+    const path = await save({
+      defaultPath: "sigillo-chiave-privata.asc",
+      filters: [{ name: "Chiave privata OpenPGP", extensions: ["asc"] }],
+    });
+    if (path) {
+      await writeTextFile(path, armored);
+    }
+    document.getElementById("export-tsk-password").value = "";
+  } catch (err) {
+    setError("export-tsk-error", String(err));
+  }
+});
+
+document.getElementById("btn-remove-identity").addEventListener("click", async () => {
+  setError("remove-error", null);
+  const confirmText = document.getElementById("remove-confirm-text").value.trim();
+  if (confirmText !== "RIMUOVI") {
+    setError("remove-error", 'Scrivi esattamente "RIMUOVI" per confermare.');
+    return;
+  }
+  try {
+    await invoke("remove_identity_from_disk");
+    resetAppToFirstRunState();
+    document.getElementById("remove-confirm-text").value = "";
+    show("screen-setup");
+  } catch (err) {
+    setError("remove-error", String(err));
+  }
+});
+
+init();

@@ -20,5 +20,9 @@ hkdf = "0.12"
 sha2 = "0.10"
 zeroize = { version = "1", features = ["zeroize_derive"] }
 anyhow = "1"
+argon2 = "0.5"
+aes-gcm = "0.10"
+rand = "0.8"
 
 [dev-dependencies]
+tempfile = "3"
