@@ -173,7 +173,7 @@ jobs:
           body: |
             Scarica il file per il tuo sistema operativo e avvialo con doppio click. Non serve installare nient'altro.
 
-            - **macOS**: `Sigillo-${{ steps.version.outputs.version }}-macOS.dmg` — apri il .dmg, trascina Sigillo nella cartella Applicazioni. Al primo avvio macOS avvisa che l'app viene da uno sviluppatore non identificato: tasto destro sull'app → Apri, per confermare che ti fidi.
+            - **macOS**: `Sigillo-${{ steps.version.outputs.version }}-macOS.dmg` — apri il .dmg, trascina Sigillo nella cartella Applicazioni. Al primo avvio macOS blocca l'app perché non è stata notarizzata da Apple (un servizio a pagamento che questo progetto open source non usa): apri **Impostazioni di Sistema → Privacy e sicurezza**, scorri fino in fondo alla sezione "Sicurezza" e clicca **Apri comunque** accanto al messaggio su Sigillo, poi conferma con password o Touch ID. Va fatto una sola volta.
             - **Windows**: `Sigillo-${{ steps.version.outputs.version }}-Windows.msi` — apri il file e segui l'installazione guidata.
             - **Linux**: `Sigillo-${{ steps.version.outputs.version }}-Linux.AppImage` — rendilo eseguibile prima di avviarlo (tasto destro → Proprietà → Permessi → "Consenti l'esecuzione del file come programma", oppure da terminale `chmod +x Sigillo-*.AppImage`), poi avvialo con doppio click.
 
