@@ -1,0 +1,157 @@
+name: Release
+
+# Pubblica automaticamente una GitHub Release, con un pacchetto installabile
+# per Mac/Windows/Linux allegato, ogni volta che viene pushato un tag Git
+# che inizia con "v" (es. v0.2.0). Per pubblicare una nuova versione di
+# Sigillo non serve altro che:
+#
+#   git tag v0.2.0
+#   git push origin v0.2.0
+#
+# Il numero di versione dentro l'app (tauri.conf.json) viene sincronizzato
+# automaticamente col tag, quindi non va aggiornato a mano da nessuna parte.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            name: macOS
+            ext: dmg
+          - platform: ubuntu-22.04
+            name: Linux
+            ext: AppImage
+          - platform: windows-latest
+            name: Windows
+            ext: msi
+
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Installa le dipendenze di sistema (solo Linux)
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libgtk-3-dev \
+            perl
+
+      - name: Installa Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache delle dipendenze Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            sigillo-core -> target
+            src-tauri -> target
+
+      - name: Installa Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Installa le dipendenze npm
+        run: npm ci
+
+      - name: Numero di versione dal tag (es. v0.2.0 -> 0.2.0)
+        id: version
+        shell: bash
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Sincronizza il numero di versione dell'app col tag
+        shell: bash
+        run: |
+          node -e "
+            const fs = require('fs');
+            const path = 'src-tauri/tauri.conf.json';
+            const j = JSON.parse(fs.readFileSync(path, 'utf8'));
+            j.version = '${{ steps.version.outputs.version }}';
+            fs.writeFileSync(path, JSON.stringify(j, null, 2) + '\n');
+          "
+
+      - name: Build del pacchetto Sigillo (${{ matrix.name }})
+        run: npm run tauri build
+
+      - name: Rinomina il pacchetto per la release
+        id: assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.version.outputs.version }}"
+          EXT="${{ matrix.ext }}"
+          NAME="${{ matrix.name }}"
+
+          SRC=$(find target/release/bundle -type f -iname "*.${EXT}" | head -n1)
+          if [ -z "$SRC" ]; then
+            echo "Nessun file .${EXT} trovato in target/release/bundle" >&2
+            find target/release/bundle -type f >&2 || true
+            exit 1
+          fi
+
+          mkdir -p dist
+          # Due copie dello stesso file: una col numero di versione (per
+          # chi guarda la pagina della release), una col nome fisso (per
+          # un link di download che non cambia mai, es. dal sito web).
+          cp "$SRC" "dist/Sigillo-${VERSION}-${NAME}.${EXT}"
+          cp "$SRC" "dist/Sigillo-${NAME}.${EXT}"
+
+      - name: Carica i pacchetti come artifact temporaneo
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets-${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Scarica i pacchetti di tutte le piattaforme
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-assets-*
+          path: dist
+          merge-multiple: true
+
+      - name: Numero di versione dal tag
+        id: version
+        shell: bash
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Pubblica la GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Sigillo ${{ steps.version.outputs.version }}
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+          files: dist/*
+          body: |
+            Scarica il file per il tuo sistema operativo e avvialo con doppio click. Non serve installare nient'altro.
+
+            - **macOS**: `Sigillo-${{ steps.version.outputs.version }}-macOS.dmg` — apri il .dmg, trascina Sigillo nella cartella Applicazioni. Al primo avvio macOS avvisa che l'app viene da uno sviluppatore non identificato: tasto destro sull'app → Apri, per confermare che ti fidi.
+            - **Windows**: `Sigillo-${{ steps.version.outputs.version }}-Windows.msi` — apri il file e segui l'installazione guidata.
+            - **Linux**: `Sigillo-${{ steps.version.outputs.version }}-Linux.AppImage` — rendilo eseguibile prima di avviarlo (tasto destro → Proprietà → Permessi → "Consenti l'esecuzione del file come programma", oppure da terminale `chmod +x Sigillo-*.AppImage`), poi avvialo con doppio click.
+
+            ---

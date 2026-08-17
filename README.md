@@ -213,6 +213,59 @@ Essendo un workspace Cargo, i pacchetti finiti si trovano nella `target/`
 alla radice del progetto, non dentro `src-tauri/`:
 `target/release/bundle/`.
 
+## Pubblicare una nuova versione (release)
+
+Non serve buildare a mano per Mac/Windows/Linux e caricare i file da
+qualche parte. Per pubblicare una nuova versione di Sigillo, scaricabile
+da chiunque, bastano due comandi dal proprio computer:
+
+```bash
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+(cambia `v0.2.0` con il numero di versione che vuoi pubblicare — deve
+sempre iniziare con la `v`). Il push del tag fa partire automaticamente
+[`.github/workflows/release.yml`](.github/workflows/release.yml), che:
+
+1. builda Sigillo su macOS, Windows e Linux;
+2. sincronizza da solo il numero di versione dentro l'app col tag (non va
+   aggiornato a mano in nessun file);
+3. pubblica una [GitHub
+   Release](https://github.com/BitcoinReport/sigillo/releases) con tre
+   file installabili allegati, con nomi chiari:
+   `Sigillo-0.2.0-macOS.dmg`, `Sigillo-0.2.0-Windows.msi`,
+   `Sigillo-0.2.0-Linux.AppImage` (Linux come AppImage, non `.deb`: si
+   scarica, si rende eseguibile con un click e si avvia, senza passare da
+   un gestore pacchetti).
+
+L'intero processo richiede circa 5 minuti. Lo stato si può seguire da
+`https://github.com/BitcoinReport/sigillo/actions`.
+
+### Link di download stabili (per il sito web)
+
+Ogni release, oltre ai tre file col numero di versione nel nome, include
+anche una seconda copia degli stessi file con un nome fisso, senza
+numero di versione: `Sigillo-macOS.dmg`, `Sigillo-Windows.msi`,
+`Sigillo-Linux.AppImage`. GitHub offre un URL che punta sempre
+all'ultima release pubblicata e che, se il nome del file allegato resta
+uguale da una release all'altra, non cambia mai: questi tre link sono
+quindi stabili per sempre e possono essere messi nei bottoni di download
+del sito senza doverli aggiornare ad ogni nuova versione:
+
+```
+https://github.com/BitcoinReport/sigillo/releases/latest/download/Sigillo-macOS.dmg
+https://github.com/BitcoinReport/sigillo/releases/latest/download/Sigillo-Windows.msi
+https://github.com/BitcoinReport/sigillo/releases/latest/download/Sigillo-Linux.AppImage
+```
+
+C'è anche un link, sempre stabile, alla pagina della release più recente
+(utile per un bottone "vedi le novita di questa versione" o simile):
+
+```
+https://github.com/BitcoinReport/sigillo/releases/latest
+```
+
 ## Testare solo il core crittografico (senza aprire l'app)
 
 Il core è pensato per essere verificabile da riga di comando, indipendentemente dalla UI:
