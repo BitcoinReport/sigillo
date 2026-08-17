@@ -10,10 +10,10 @@ let pendingSeedWords = [];
 
 // ---------- Stato applicativo: una sola vista visibile alla volta ----------
 //
-// setView() e l'UNICO modo per cambiare schermata: aggiunge/rimuove la
+// setView() è l'UNICO modo per cambiare schermata: aggiunge/rimuove la
 // classe "active" (mai display:none via l'attributo hidden, vedi il
-// commento in styles.css sul perche). Ogni bottone che fa avanzare il
-// flusso chiama setView con l'id della vista successiva; nessuna vista e
+// commento in styles.css sul perché). Ogni bottone che fa avanzare il
+// flusso chiama setView con l'id della vista successiva; nessuna vista è
 // mai raggiungibile per scroll.
 
 function setView(id) {
@@ -29,8 +29,8 @@ document.querySelectorAll(".link-back").forEach((btn) => {
 /**
  * Esegue `action` (una funzione async) mostrando uno stato di caricamento
  * sul bottone che l'ha attivata: disabilita il bottone e ci mette sopra
- * uno spinner finche' la chiamata non e' finita, cosi ogni azione asincrona
- * (generare chiavi, cifrare, sbloccare...) da un feedback immediato invece
+ * uno spinner finché la chiamata non è finita, così ogni azione asincrona
+ * (generare chiavi, cifrare, sbloccare...) dà un feedback immediato invece
  * di sembrare "morta" per uno o due secondi.
  */
 async function withLoading(button, action) {
@@ -63,8 +63,8 @@ async function renderIdentity(view) {
   document.getElementById("my-public-key").value = view.public_key_armored;
   document.getElementById("btn-open-advanced").hidden = false;
 
-  // La rubrica e salvata sul dispositivo: la ricarichiamo ad ogni sblocco,
-  // cosi i contatti aggiunti in sessioni precedenti sono ancora li.
+  // La rubrica è salvata sul dispositivo: la ricarichiamo ad ogni sblocco,
+  // così i contatti aggiunti in sessioni precedenti sono ancora lì.
   contacts.length = 0;
   try {
     const saved = await invoke("load_contacts");
@@ -174,7 +174,7 @@ function resetAppToFirstRunState() {
   document.getElementById("message-text").value = "";
 }
 
-// ---------- Avvio: identita gia presente su questo dispositivo? ----------
+// ---------- Avvio: identità già presente su questo dispositivo? ----------
 
 async function init() {
   try {
@@ -230,7 +230,7 @@ document.getElementById("btn-forgot-remove").addEventListener("click", async (e)
   }
 });
 
-// ---------- Schermata: crea nuova identita ----------
+// ---------- Schermata: crea nuova identità ----------
 
 document.getElementById("btn-generate").addEventListener("click", async (e) => {
   setError("setup-error", null);
@@ -251,7 +251,7 @@ document.getElementById("btn-generate").addEventListener("click", async (e) => {
   }
 });
 
-// ---------- Schermata: ho gia un'identita (import) ----------
+// ---------- Schermata: ho già un'identità (import) ----------
 
 document.getElementById("btn-import").addEventListener("click", async (e) => {
   setError("import-error", null);
@@ -262,7 +262,7 @@ document.getElementById("btn-import").addEventListener("click", async (e) => {
       invoke("import_identity", { phrase, displayName })
     );
     await renderIdentity(view);
-    // Chi reinserisce una seed phrase la conosce gia: non c'e bisogno di
+    // Chi reinserisce una seed phrase la conosce già: non c'è bisogno di
     // rimostrarla/confermarla, si passa direttamente a proteggere questo
     // dispositivo con una passphrase locale.
     setView("screen-set-passphrase");
@@ -465,12 +465,12 @@ document.getElementById("btn-decrypt").addEventListener("click", async (e) => {
     if (result.signature_status === "verificata") {
       const known = contacts.find((c) => c.fingerprintHex === result.signer_fingerprint);
       statusEl.textContent = known
-        ? `Firma verificata: e di ${known.name}.`
-        : `Firma verificata (${result.signer_fingerprint}), ma questo contatto non e in rubrica.`;
+        ? `Firma verificata: è di ${known.name}.`
+        : `Firma verificata (${result.signer_fingerprint}), ma questo contatto non è in rubrica.`;
       statusEl.classList.add("verified");
     } else if (result.signature_status === "non_verificabile") {
       statusEl.textContent =
-        "Il messaggio e firmato, ma non conosci ancora la chiave di chi l'ha firmato: aggiungilo in rubrica per verificarlo.";
+        "Il messaggio è firmato, ma non conosci ancora la chiave di chi l'ha firmato: aggiungilo in rubrica per verificarlo.";
       statusEl.classList.add("unverifiable");
     } else {
       statusEl.textContent = "Messaggio non firmato.";

@@ -67,7 +67,7 @@ fn set_current_identity(state: &State<AppState>, id: identity::Identity, display
     *state.display_name.lock().unwrap() = Some(display_name.to_string());
 }
 
-/// Vero se su questo dispositivo esiste gia un'identita salvata: decide se
+/// Vero se su questo dispositivo esiste già un'identità salvata: decide se
 /// l'app deve mostrare il wizard di generazione/import (primo avvio) o la
 /// schermata di sblocco con la sola passphrase (avvii successivi).
 #[tauri::command]
@@ -125,7 +125,7 @@ fn confirm_seed_words(
     positions_and_words: Vec<(u32, String)>,
 ) -> Result<bool, String> {
     let guard = state.identity.lock().unwrap();
-    let id = guard.as_ref().ok_or("nessuna identita generata")?;
+    let id = guard.as_ref().ok_or("nessuna identità generata")?;
     let words = id.seed_words();
 
     for (position, word) in positions_and_words {
@@ -139,7 +139,7 @@ fn confirm_seed_words(
     Ok(true)
 }
 
-/// Salva su disco, cifrata con `passphrase`, l'identita attualmente in
+/// Salva su disco, cifrata con `passphrase`, l'identità attualmente in
 /// memoria (generata o importata in questa sessione). Da chiamare come
 /// ultimo passo del wizard di primo avvio.
 #[tauri::command]
@@ -155,7 +155,7 @@ fn save_identity_to_disk(
     }
 
     let guard = state.identity.lock().unwrap();
-    let id = guard.as_ref().ok_or("nessuna identita da salvare")?;
+    let id = guard.as_ref().ok_or("nessuna identità da salvare")?;
     let name_guard = state.display_name.lock().unwrap();
     let display_name = name_guard.as_deref().unwrap_or("Io");
 
@@ -164,8 +164,8 @@ fn save_identity_to_disk(
         .map_err(|e| e.to_string())
 }
 
-/// Sblocca, con la sola passphrase locale (non la seed phrase), l'identita
-/// gia salvata su questo dispositivo.
+/// Sblocca, con la sola passphrase locale (non la seed phrase), l'identità
+/// già salvata su questo dispositivo.
 #[tauri::command]
 fn unlock_identity(
     app: AppHandle,
@@ -182,7 +182,7 @@ fn unlock_identity(
     Ok(view)
 }
 
-/// Rimuove in modo sicuro l'identita salvata su questo dispositivo, e con
+/// Rimuove in modo sicuro l'identità salvata su questo dispositivo, e con
 /// essa la rubrica: dopo questa chiamata il prossimo avvio torna a
 /// mostrare il wizard di generazione/import, come al primo avvio, con una
 /// rubrica di nuovo vuota.
@@ -191,7 +191,7 @@ fn remove_identity_from_disk(app: AppHandle, state: State<AppState>) -> Result<(
     let path = vault_path(&app)?;
     storage::remove_identity(&path).map_err(|e| e.to_string())?;
     // La rubrica potrebbe non esistere ancora (nessun contatto mai
-    // aggiunto): non e un errore, e il caso normale.
+    // aggiunto): non è un errore, è il caso normale.
     let _ = std::fs::remove_file(contacts_path(&app)?);
     *state.identity.lock().unwrap() = None;
     *state.display_name.lock().unwrap() = None;
@@ -220,9 +220,9 @@ fn contact_view(name: String, armored_public_key: String) -> Result<ContactView,
     })
 }
 
-/// Carica la rubrica salvata su questo dispositivo (vuota se non e mai
-/// stato aggiunto nessun contatto). Da chiamare quando l'identita viene
-/// sbloccata/creata, cosi la rubrica non riparte vuota ad ogni avvio.
+/// Carica la rubrica salvata su questo dispositivo (vuota se non è mai
+/// stato aggiunto nessun contatto). Da chiamare quando l'identità viene
+/// sbloccata/creata, così la rubrica non riparte vuota ad ogni avvio.
 #[tauri::command]
 fn load_contacts(app: AppHandle) -> Result<Vec<ContactView>, String> {
     let path = contacts_path(&app)?;
@@ -276,12 +276,12 @@ impl From<keyinfo::KeyDetail> for KeyDetailView {
     }
 }
 
-/// Dettagli tecnici (algoritmo, date) della propria identita, per la
+/// Dettagli tecnici (algoritmo, date) della propria identità, per la
 /// sezione "avanzate".
 #[tauri::command]
 fn my_technical_details(state: State<AppState>) -> Result<Vec<KeyDetailView>, String> {
     let guard = state.identity.lock().unwrap();
-    let id = guard.as_ref().ok_or("genera o importa prima la tua identita")?;
+    let id = guard.as_ref().ok_or("genera o importa prima la tua identità")?;
     keyinfo::technical_details(&id.cert)
         .map(|details| details.into_iter().map(Into::into).collect())
         .map_err(|e| e.to_string())
@@ -303,7 +303,7 @@ fn contact_technical_details(armored_public_key: String) -> Result<Vec<KeyDetail
 #[tauri::command]
 fn export_private_key_file(state: State<AppState>, password: String) -> Result<String, String> {
     let guard = state.identity.lock().unwrap();
-    let id = guard.as_ref().ok_or("genera o importa prima la tua identita")?;
+    let id = guard.as_ref().ok_or("genera o importa prima la tua identità")?;
     identity::export_private_key_file(&id.cert, &password).map_err(|e| e.to_string())
 }
 
@@ -317,7 +317,7 @@ fn encrypt_message(
     let guard = state.identity.lock().unwrap();
     let id = guard
         .as_ref()
-        .ok_or("genera o importa prima la tua identita")?;
+        .ok_or("genera o importa prima la tua identità")?;
 
     let recipients: Vec<sequoia_openpgp::Cert> = recipients_armored
         .iter()
@@ -344,7 +344,7 @@ fn decrypt_message(
     let guard = state.identity.lock().unwrap();
     let id = guard
         .as_ref()
-        .ok_or("genera o importa prima la tua identita")?;
+        .ok_or("genera o importa prima la tua identità")?;
 
     let contacts_certs: Vec<sequoia_openpgp::Cert> = contacts_armored
         .iter()

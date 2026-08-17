@@ -32,9 +32,9 @@ pub fn import_public_key(data: &[u8]) -> Result<Cert> {
 /// da confrontare a voce o di persona con il contatto per verificare che
 /// nessuno si stia fingendo qualcun altro.
 ///
-/// Non e un meccanismo crittografico: e solo una rappresentazione piu
+/// Non è un meccanismo crittografico: è solo una rappresentazione più
 /// facile da leggere e confrontare rispetto alla stringa esadecimale del
-/// fingerprint. Riusa la wordlist inglese di BIP39, gia inclusa
+/// fingerprint. Riusa la wordlist inglese di BIP39, già inclusa
 /// nell'applicazione per le seed phrase.
 pub fn fingerprint_to_words(fingerprint: &openpgp::Fingerprint) -> Vec<&'static str> {
     let bytes = fingerprint.as_bytes();
@@ -61,22 +61,22 @@ pub fn fingerprint_to_words(fingerprint: &openpgp::Fingerprint) -> Vec<&'static 
     words
 }
 
-/// Un contatto salvato in rubrica, cosi come persiste su disco.
+/// Un contatto salvato in rubrica, così come persiste su disco.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SavedContact {
     pub name: String,
     pub public_key_armored: String,
 }
 
-/// Carica la rubrica salvata su disco. Se non e mai stato salvato nulla
+/// Carica la rubrica salvata su disco. Se non è mai stato salvato nulla
 /// (nessun file ancora), restituisce una rubrica vuota invece di un
-/// errore: e lo stato normale al primo avvio.
+/// errore: è lo stato normale al primo avvio.
 pub fn load_address_book(path: &Path) -> Result<Vec<SavedContact>> {
     if !path.is_file() {
         return Ok(Vec::new());
     }
     let data = fs::read_to_string(path).context("impossibile leggere la rubrica salvata")?;
-    serde_json::from_str(&data).context("il file della rubrica e danneggiato")
+    serde_json::from_str(&data).context("il file della rubrica è danneggiato")
 }
 
 /// Salva l'intera rubrica su disco, sovrascrivendo il file precedente.
@@ -92,7 +92,7 @@ pub fn save_address_book(path: &Path, contacts: &[SavedContact]) -> Result<()> {
     let data = serde_json::to_string_pretty(contacts)
         .context("errore interno nella serializzazione della rubrica")?;
 
-    // File temporaneo + rename atomico, come per il vault dell'identita:
+    // File temporaneo + rename atomico, come per il vault dell'identità:
     // un crash a meta scrittura non deve lasciare una rubrica troncata.
     let tmp_path = path.with_extension("tmp");
     fs::write(&tmp_path, data).context("impossibile scrivere la rubrica")?;
@@ -107,7 +107,7 @@ mod tests {
 
     #[test]
     fn import_rejects_non_openpgp_data() {
-        assert!(import_public_key(b"questo non e affatto una chiave").is_err());
+        assert!(import_public_key(b"questo non e' affatto una chiave").is_err());
     }
 
     #[test]

@@ -81,14 +81,14 @@ body {
 }
 
 /*
- * Una sola schermata visibile alla volta: lo stato "quale schermata e
- * attiva" vive in main.js (setView) ed e l'unica fonte di verita. Qui
+ * Una sola schermata visibile alla volta: lo stato "quale schermata è
+ * attiva" vive in main.js (setView) ed è l'unica fonte di verità. Qui
  * usiamo una classe (.active), non l'attributo [hidden]: l'attributo
- * [hidden] ha la stessa specificita di una regola con una singola classe,
+ * [hidden] ha la stessa specificità di una regola con una singola classe,
  * e nella cascata una regola d'autore (come .screen{display:flex} qui
  * sotto) vince comunque sulla regola di default [hidden]{display:none}
  * dello user-agent, quindi affidarsi a [hidden] per nascondere elementi
- * gia soggetti a regole d'autore sullo stesso selettore e fragile.
+ * già soggetti a regole d'autore sullo stesso selettore è fragile.
  */
 .screen {
   display: none;

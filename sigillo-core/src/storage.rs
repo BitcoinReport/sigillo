@@ -1,14 +1,14 @@
-//! Salvataggio cifrato a riposo dell'identita sul dispositivo.
+//! Salvataggio cifrato a riposo dell'identità sul dispositivo.
 //!
 //! Il file salvato su disco non contiene mai la seed phrase (o la chiave
-//! privata) in chiaro: e sempre cifrato con una chiave derivata dalla
+//! privata) in chiaro: è sempre cifrato con una chiave derivata dalla
 //! passphrase locale scelta dall'utente, tramite Argon2id (resistente ad
 //! attacchi a forza bruta) + AES-256-GCM (cifratura autenticata: un file
 //! manomesso o una passphrase sbagliata vengono rilevati, non decifrati
 //! per errore).
 //!
-//! Questa passphrase locale e diversa dalla seed phrase: sblocca solo
-//! l'identita gia salvata su *questo* dispositivo, non permette di
+//! Questa passphrase locale è diversa dalla seed phrase: sblocca solo
+//! l'identità già salvata su *questo* dispositivo, non permette di
 //! rigenerarla altrove (per quello serve la seed phrase).
 
 use std::fs;
@@ -33,7 +33,7 @@ const ARGON2_M_COST: u32 = 19_456;
 const ARGON2_T_COST: u32 = 2;
 const ARGON2_P_COST: u32 = 1;
 
-/// Vero se esiste gia un'identita salvata su questo dispositivo in `path`.
+/// Vero se esiste già un'identità salvata su questo dispositivo in `path`.
 pub fn vault_exists(path: &Path) -> bool {
     path.is_file()
 }
@@ -64,16 +64,16 @@ fn encode_payload(display_name: &str, seed_phrase: &str) -> Zeroizing<Vec<u8>> {
 
 fn decode_payload(payload: &[u8]) -> Result<(String, String)> {
     if payload.len() < 2 {
-        bail!("file dell'identita corrotto");
+        bail!("file dell'identità corrotto");
     }
     let name_len = u16::from_le_bytes([payload[0], payload[1]]) as usize;
     let name_start = 2;
     let name_end = name_start + name_len;
     if payload.len() < name_end + 2 {
-        bail!("file dell'identita corrotto");
+        bail!("file dell'identità corrotto");
     }
     let display_name = String::from_utf8(payload[name_start..name_end].to_vec())
-        .context("file dell'identita corrotto (nome non valido)")?;
+        .context("file dell'identità corrotto (nome non valido)")?;
 
     let phrase_len_start = name_end;
     let phrase_len =
@@ -81,15 +81,15 @@ fn decode_payload(payload: &[u8]) -> Result<(String, String)> {
     let phrase_start = phrase_len_start + 2;
     let phrase_end = phrase_start + phrase_len;
     if payload.len() != phrase_end {
-        bail!("file dell'identita corrotto");
+        bail!("file dell'identità corrotto");
     }
     let seed_phrase = String::from_utf8(payload[phrase_start..phrase_end].to_vec())
-        .context("file dell'identita corrotto (seed phrase non valida)")?;
+        .context("file dell'identità corrotto (seed phrase non valida)")?;
 
     Ok((display_name, seed_phrase))
 }
 
-/// Cifra e salva l'identita (nome visualizzato + seed phrase) in `path`,
+/// Cifra e salva l'identità (nome visualizzato + seed phrase) in `path`,
 /// protetta dalla `passphrase` locale scelta dall'utente. Sovrascrive un
 /// eventuale file precedente.
 pub fn save_identity(
@@ -99,7 +99,7 @@ pub fn save_identity(
     seed_phrase: &str,
 ) -> Result<()> {
     if passphrase.is_empty() {
-        bail!("la passphrase non puo essere vuota");
+        bail!("la passphrase non può essere vuota");
     }
 
     if let Some(parent) = path.parent() {
@@ -118,7 +118,7 @@ pub fn save_identity(
     let payload = encode_payload(display_name, seed_phrase);
     let ciphertext = cipher
         .encrypt(nonce, payload.as_slice())
-        .map_err(|_| anyhow::anyhow!("cifratura dell'identita fallita"))?;
+        .map_err(|_| anyhow::anyhow!("cifratura dell'identità fallita"))?;
 
     let mut out = Vec::with_capacity(4 + 1 + SALT_LEN + 12 + NONCE_LEN + ciphertext.len());
     out.extend_from_slice(MAGIC);
@@ -130,33 +130,33 @@ pub fn save_identity(
     out.extend_from_slice(&nonce_bytes);
     out.extend_from_slice(&ciphertext);
 
-    // File temporaneo + rename atomico, cosi un crash a meta scrittura non
+    // File temporaneo + rename atomico, così un crash a meta scrittura non
     // lascia un vault troncato/corrotto al posto di quello precedente.
     let tmp_path = path.with_extension("tmp");
     {
-        let mut f = fs::File::create(&tmp_path).context("impossibile scrivere il file dell'identita")?;
+        let mut f = fs::File::create(&tmp_path).context("impossibile scrivere il file dell'identità")?;
         f.write_all(&out)?;
         f.sync_all()?;
     }
-    fs::rename(&tmp_path, path).context("impossibile salvare il file dell'identita")?;
+    fs::rename(&tmp_path, path).context("impossibile salvare il file dell'identità")?;
 
     Ok(())
 }
 
-/// Decifra l'identita salvata in `path` con la `passphrase` fornita.
+/// Decifra l'identità salvata in `path` con la `passphrase` fornita.
 /// Restituisce `(nome_visualizzato, seed_phrase)`.
 pub fn load_identity(path: &Path, passphrase: &str) -> Result<(String, String)> {
-    let data = fs::read(path).context("nessuna identita salvata su questo dispositivo")?;
+    let data = fs::read(path).context("nessuna identità salvata su questo dispositivo")?;
 
     if data.len() < 4 || &data[0..4] != MAGIC {
-        bail!("il file dell'identita non e valido o e di una versione non supportata");
+        bail!("il file dell'identità non è valido o è di una versione non supportata");
     }
     let mut offset = 4;
 
-    let salt_len = *data.get(offset).context("file dell'identita corrotto")? as usize;
+    let salt_len = *data.get(offset).context("file dell'identità corrotto")? as usize;
     offset += 1;
     if data.len() < offset + salt_len + 12 + NONCE_LEN {
-        bail!("file dell'identita corrotto");
+        bail!("file dell'identità corrotto");
     }
     let salt = &data[offset..offset + salt_len];
     offset += salt_len;
@@ -191,8 +191,8 @@ pub fn load_identity(path: &Path, passphrase: &str) -> Result<(String, String)> 
     decode_payload(&payload)
 }
 
-/// Cancella in modo sicuro l'identita salvata su questo dispositivo:
-/// sovrascrive il file con zeri prima di rimuoverlo, cosi anche un
+/// Cancella in modo sicuro l'identità salvata su questo dispositivo:
+/// sovrascrive il file con zeri prima di rimuoverlo, così anche un
 /// recupero grezzo dal disco non ritroverebbe la seed phrase cifrata.
 /// Dopo questa chiamata `vault_exists` torna a restituire `false`.
 pub fn remove_identity(path: &Path) -> Result<()> {
@@ -208,7 +208,7 @@ pub fn remove_identity(path: &Path) -> Result<()> {
         }
     }
 
-    fs::remove_file(path).context("impossibile rimuovere il file dell'identita")?;
+    fs::remove_file(path).context("impossibile rimuovere il file dell'identità")?;
     Ok(())
 }
 
@@ -253,7 +253,7 @@ mod tests {
         for word in seed_phrase.split_whitespace() {
             assert!(
                 !raw.windows(word.len()).any(|w| w == word.as_bytes()),
-                "la parola '{word}' e presente in chiaro nel file salvato"
+                "la parola '{word}' è presente in chiaro nel file salvato"
             );
         }
     }
@@ -284,6 +284,6 @@ mod tests {
         fs::write(&path, b"non sono un vault Sigillo").unwrap();
 
         let err = load_identity(&path, "qualunque").unwrap_err();
-        assert!(err.to_string().contains("non e valido"));
+        assert!(err.to_string().contains("non è valido"));
     }
 }

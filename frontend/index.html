@@ -11,7 +11,7 @@
       <div class="header-row">
         <div>
           <h1>Sigillo</h1>
-          <p class="tagline">Scrivi, cifra, condividi. Nessuno tranne il destinatario puo leggere.</p>
+          <p class="tagline">Scrivi, cifra, condividi. Nessuno tranne il destinatario può leggere.</p>
         </div>
         <button id="btn-open-advanced" class="gear-btn" title="Avanzate" hidden>⚙</button>
       </div>
@@ -22,11 +22,11 @@
       <div class="card"><p class="hint">Caricamento...</p></div>
     </section>
 
-    <!-- ============ SCHERMATA: sblocco (identita gia presente su questo dispositivo) ============ -->
+    <!-- ============ SCHERMATA: sblocco (identità già presente su questo dispositivo) ============ -->
     <section id="screen-unlock" class="screen">
       <div class="card">
         <h2>Bentornato</h2>
-        <p>Questo dispositivo ha gia un'identita Sigillo. Inserisci la passphrase che avevi scelto per sbloccarla.</p>
+        <p>Questo dispositivo ha già un'identità Sigillo. Inserisci la passphrase che avevi scelto per sbloccarla.</p>
 
         <label for="unlock-passphrase">Passphrase</label>
         <input id="unlock-passphrase" type="password" placeholder="La tua passphrase" />
@@ -39,49 +39,49 @@
         <details class="forgot-passphrase">
           <summary>Ho dimenticato la passphrase</summary>
           <p class="warning">
-            Non c'e modo di recuperare la passphrase. Puoi pero rimuovere
-            l'identita salvata su questo dispositivo e reimportarla con la
-            tua seed phrase (le 12 o 24 parole originali). Se non hai piu
-            neanche quella, l'identita e persa per sempre: e per questo che
+            Non c'è modo di recuperare la passphrase. Puoi però rimuovere
+            l'identità salvata su questo dispositivo e reimportarla con la
+            tua seed phrase (le 12 o 24 parole originali). Se non hai più
+            neanche quella, l'identità è persa per sempre: è per questo che
             va scritta su carta.
           </p>
           <label for="forgot-confirm-text">Scrivi RIMUOVI per confermare</label>
           <input id="forgot-confirm-text" type="text" placeholder="RIMUOVI" />
-          <button id="btn-forgot-remove" class="danger">Rimuovi identita da questo dispositivo</button>
+          <button id="btn-forgot-remove" class="danger">Rimuovi identità da questo dispositivo</button>
           <p id="forgot-error" class="error" hidden></p>
         </details>
       </div>
     </section>
 
-    <!-- ============ SCHERMATA: ingresso (nessuna identita) ============ -->
+    <!-- ============ SCHERMATA: ingresso (nessuna identità) ============ -->
     <section id="screen-welcome" class="screen">
       <div class="card">
         <h2>Benvenuto in Sigillo</h2>
         <p>
-          Scrivi messaggi che solo il destinatario puo leggere. Non serve
+          Scrivi messaggi che solo il destinatario può leggere. Non serve
           un'email, non serve una password su un server: tutto resta su
           questo dispositivo.
         </p>
 
         <div class="button-row stacked">
-          <button id="btn-go-create" class="primary">Crea una nuova identita</button>
-          <button id="btn-go-import" class="secondary">Ho gia un'identita</button>
+          <button id="btn-go-create" class="primary">Crea una nuova identità</button>
+          <button id="btn-go-import" class="secondary">Ho già un'identità</button>
         </div>
       </div>
     </section>
 
-    <!-- ============ SCHERMATA: crea nuova identita ============ -->
+    <!-- ============ SCHERMATA: crea nuova identità ============ -->
     <section id="screen-create-name" class="screen">
       <div class="card">
         <button class="link-back" data-back-to="screen-welcome">← Indietro</button>
-        <h2>Crea la tua identita</h2>
+        <h2>Crea la tua identità</h2>
 
         <label for="display-name">Come vuoi chiamarti? (visibile solo ai tuoi contatti)</label>
         <input id="display-name" type="text" placeholder="Es. Michele" />
 
         <div class="word-count-choice">
           <label><input type="radio" name="word-count" value="12" checked /> 12 parole</label>
-          <label><input type="radio" name="word-count" value="24" /> 24 parole (piu sicuro)</label>
+          <label><input type="radio" name="word-count" value="24" /> 24 parole (più sicuro)</label>
         </div>
 
         <div class="button-row">
@@ -92,11 +92,11 @@
       </div>
     </section>
 
-    <!-- ============ SCHERMATA: ho gia un'identita ============ -->
+    <!-- ============ SCHERMATA: ho già un'identità ============ -->
     <section id="screen-import" class="screen">
       <div class="card">
         <button class="link-back" data-back-to="screen-welcome">← Indietro</button>
-        <h2>Ripristina la tua identita</h2>
+        <h2>Ripristina la tua identità</h2>
         <p>Scrivi o incolla la tua seed phrase (12 o 24 parole, separate da spazi).</p>
 
         <label for="import-display-name">Come vuoi chiamarti? (visibile solo ai tuoi contatti)</label>
@@ -106,7 +106,7 @@
         <textarea id="import-phrase" rows="3" placeholder="Scrivi qui le 12 o 24 parole, separate da spazi"></textarea>
 
         <div class="button-row">
-          <button id="btn-import" class="primary">Ripristina identita</button>
+          <button id="btn-import" class="primary">Ripristina identità</button>
         </div>
 
         <p id="import-error" class="error" hidden></p>
@@ -118,7 +118,7 @@
       <div class="card">
         <h2>Scrivi questa frase su carta</h2>
         <p class="warning">
-          Questa frase vale quanto la tua identita digitale. Chi la conosce puo
+          Questa frase vale quanto la tua identità digitale. Chi la conosce può
           leggere i tuoi messaggi cifrati e firmare come te. Scrivila su carta,
           non fotografarla, non salvarla su file.
         </p>
@@ -138,7 +138,7 @@
         <div id="confirm-fields" class="confirm-grid"></div>
 
         <button id="btn-confirm-check" class="primary">Verifica e continua</button>
-        <p id="confirm-error" class="error" hidden>Una o piu parole non corrispondono. Controlla i tuoi appunti.</p>
+        <p id="confirm-error" class="error" hidden>Una o più parole non corrispondono. Controlla i tuoi appunti.</p>
       </div>
     </section>
 
@@ -148,10 +148,10 @@
         <h2>Proteggi questo dispositivo</h2>
         <p>
           Scegli una passphrase per sbloccare Sigillo su <em>questo</em>
-          computer. Non e la tua seed phrase (quella serve solo per
-          reimportare l'identita su un altro dispositivo, o se rimuovi
-          l'identita da qui): la passphrase resta locale e la puoi
-          cambiare quando vuoi rimuovendo e reimportando l'identita.
+          computer. Non è la tua seed phrase (quella serve solo per
+          reimportare l'identità su un altro dispositivo, o se rimuovi
+          l'identità da qui): la passphrase resta locale e la puoi
+          cambiare quando vuoi rimuovendo e reimportando l'identità.
         </p>
 
         <label for="set-passphrase">Passphrase (almeno 8 caratteri)</label>
@@ -173,7 +173,7 @@
         <button class="tab-btn active" data-tab="tab-write">Scrivi</button>
         <button class="tab-btn" data-tab="tab-decrypt">Decifra</button>
         <button class="tab-btn" data-tab="tab-contacts">Rubrica</button>
-        <button class="tab-btn" data-tab="tab-identity">La mia identita</button>
+        <button class="tab-btn" data-tab="tab-identity">La mia identità</button>
       </nav>
 
       <div id="tab-write" class="tab-panel active">
@@ -193,7 +193,7 @@
             Firma questo messaggio
           </label>
           <p id="sign-message-hint" class="hint reveal" hidden>
-            Aggiungi la tua firma digitale: chi riceve il messaggio potra
+            Aggiungi la tua firma digitale: chi riceve il messaggio potrà
             verificare che sei stato davvero tu a scriverlo.
           </p>
 
@@ -262,7 +262,7 @@
 
       <div id="tab-identity" class="tab-panel">
         <div class="card">
-          <h2>La mia identita</h2>
+          <h2>La mia identità</h2>
           <p><strong>Nome:</strong> <span id="my-name"></span></p>
 
           <label>Impronta (fingerprint) — leggila a voce a un contatto per verificarla</label>
@@ -287,7 +287,7 @@
         <h2>Avanzate</h2>
         <p class="hint">
           Questa sezione contiene informazioni tecniche, utili solo se sai
-          gia cosa significano. Il resto dell'app non ne ha bisogno.
+          già cosa significano. Il resto dell'app non ne ha bisogno.
         </p>
 
         <h3>La mia chiave</h3>
@@ -304,7 +304,7 @@
 
         <h3>Esporta la chiave privata come file</h3>
         <p class="warning">
-          Meno consigliato della seed phrase: un file digitale puo essere
+          Meno consigliato della seed phrase: un file digitale può essere
           copiato, sincronizzato per errore su un cloud, o rubato da un
           malware. Se puoi, preferisci sempre la seed phrase scritta su
           carta. Se esporti comunque questo file, resta cifrato con la
@@ -319,17 +319,17 @@
 
         <hr />
 
-        <h3>Rimuovi identita da questo computer</h3>
+        <h3>Rimuovi identità da questo computer</h3>
         <p class="warning">
-          Sei sicuro? Dopo questa azione dovrai reimportare la tua identita
+          Sei sicuro? Dopo questa azione dovrai reimportare la tua identità
           con la seed phrase per usarla di nuovo su questo dispositivo.
-          L'identita in se non va persa (resta valida ovunque tu abbia la
-          seed phrase), ma qui verra cancellata insieme alla passphrase
+          L'identità in sé non va persa (resta valida ovunque tu abbia la
+          seed phrase), ma qui verrà cancellata insieme alla passphrase
           locale.
         </p>
         <label for="remove-confirm-text">Scrivi RIMUOVI per confermare</label>
         <input id="remove-confirm-text" type="text" placeholder="RIMUOVI" />
-        <button id="btn-remove-identity" class="danger">Rimuovi identita da questo computer</button>
+        <button id="btn-remove-identity" class="danger">Rimuovi identità da questo computer</button>
         <p id="remove-error" class="error" hidden></p>
       </div>
     </section>

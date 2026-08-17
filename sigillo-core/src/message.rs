@@ -19,7 +19,7 @@ use openpgp::serialize::stream::{Armorer, Encryptor2, LiteralWriter, Message, Si
 use openpgp::types::SymmetricAlgorithm;
 use openpgp::{Cert, Fingerprint, KeyHandle};
 
-/// Cifra `plaintext` per uno o piu destinatari, con firma opzionale del
+/// Cifra `plaintext` per uno o più destinatari, con firma opzionale del
 /// mittente. Restituisce il messaggio in formato ASCII armored (.asc),
 /// testo puro leggibile e riconoscibile su qualsiasi client OpenPGP.
 pub fn encrypt(
@@ -71,7 +71,7 @@ pub fn encrypt(
                 .revoked(false)
                 .for_signing()
                 .next()
-                .context("la tua identita non ha una chiave di firma valida")?
+                .context("la tua identità non ha una chiave di firma valida")?
                 .key()
                 .clone()
                 .into_keypair()
@@ -96,7 +96,7 @@ pub enum SignatureStatus {
     Unsigned,
     /// Firma valida, del titolare del fingerprint indicato.
     Verified(Fingerprint),
-    /// Il messaggio conteneva una firma, ma non e stato possibile
+    /// Il messaggio conteneva una firma, ma non è stato possibile
     /// verificarla (chiave del mittente sconosciuta, o firma non valida).
     Unverifiable,
 }
@@ -197,7 +197,7 @@ impl<'a> DecryptionHelper for Helper<'a> {
 }
 
 /// Decifra un messaggio ASCII-armored, verificando anche l'eventuale
-/// firma del mittente. `contacts` e l'elenco delle chiavi pubbliche note
+/// firma del mittente. `contacts` è l'elenco delle chiavi pubbliche note
 /// (la rubrica), usato per verificare le firme.
 pub fn decrypt(identity: &Cert, contacts: &[Cert], armored: &str) -> Result<DecryptedMessage> {
     let p = &StandardPolicy::new();
@@ -211,7 +211,7 @@ pub fn decrypt(identity: &Cert, contacts: &[Cert], armored: &str) -> Result<Decr
     };
 
     let mut decryptor = DecryptorBuilder::from_bytes(armored.as_bytes())
-        .context("il testo incollato non e un messaggio OpenPGP valido, o e danneggiato")?
+        .context("il testo incollato non è un messaggio OpenPGP valido, o è danneggiato")?
         .with_policy(p, None, helper)
         .map_err(|_| {
             if *found_matching_key.borrow() {
@@ -220,14 +220,14 @@ pub fn decrypt(identity: &Cert, contacts: &[Cert], armored: &str) -> Result<Decr
                 )
             } else {
                 anyhow::anyhow!(
-                    "questo messaggio non e indirizzato a te: nessuna delle tue chiavi corrisponde"
+                    "questo messaggio non è indirizzato a te: nessuna delle tue chiavi corrisponde"
                 )
             }
         })?;
 
     let mut plaintext = String::new();
     std::io::Read::read_to_string(&mut decryptor, &mut plaintext)
-        .context("il contenuto decifrato non e testo leggibile")?;
+        .context("il contenuto decifrato non è testo leggibile")?;
 
     let signature = decryptor.into_helper().signature;
 

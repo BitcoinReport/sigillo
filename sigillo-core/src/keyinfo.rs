@@ -51,7 +51,7 @@ pub fn technical_details(cert: &Cert) -> Result<Vec<KeyDetail>> {
     for ka in cert.keys().with_policy(p, None) {
         let is_primary = ka.key().fingerprint() == primary_fingerprint;
         let label = if is_primary {
-            "Chiave primaria (identita e firma)".to_string()
+            "Chiave primaria (identità e firma)".to_string()
         } else {
             "Sottochiave (cifratura dei messaggi)".to_string()
         };
@@ -86,7 +86,7 @@ mod tests {
         // Le nostre chiavi non hanno scadenza.
         assert!(details.iter().all(|d| d.expires_unix.is_none()));
 
-        // La data di creazione e il timestamp fisso documentato in identity.rs.
+        // La data di creazione è il timestamp fisso documentato in identity.rs.
         assert!(details.iter().all(|d| d.created_unix == 1_231_006_505));
     }
 }
