@@ -166,8 +166,15 @@ l'applicazione desktop completa sotto GPLv3.
 
 ### macOS
 
+Se non hai già gli Xcode Command Line Tools:
+
 ```bash
-xcode-select --install          # se non già installati
+xcode-select --install
+```
+
+Poi installa Rust e Node:
+
+```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 brew install node
 ```
@@ -192,11 +199,16 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 ## Build ed esecuzione
 
-Dalla cartella `Sigillo/`:
+Dalla cartella `Sigillo/`, la prima volta scarica la CLI di Tauri:
 
 ```bash
-npm install                 # una tantum: scarica la CLI di Tauri
-npm run tauri dev           # avvia l'app in modalità sviluppo
+npm install
+```
+
+Poi, per avviare l'app in modalità sviluppo:
+
+```bash
+npm run tauri dev
 ```
 
 Il primo build compila anche OpenSSL da sorgente e può richiedere alcuni
