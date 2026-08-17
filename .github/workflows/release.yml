@@ -127,6 +127,8 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+
       - name: Scarica i pacchetti di tutte le piattaforme
         uses: actions/download-artifact@v4
         with:
@@ -138,6 +140,27 @@ jobs:
         id: version
         shell: bash
         run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Importa la chiave GPG per firmare i pacchetti
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.RELEASE_GPG_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          echo "$GPG_PRIVATE_KEY" | gpg --batch --import
+          echo "allow-loopback-pinentry" >> ~/.gnupg/gpg-agent.conf
+          gpgconf --reload gpg-agent
+
+      - name: Firma ciascun pacchetto con una firma OpenPGP separata
+        env:
+          GPG_PASSPHRASE: ${{ secrets.RELEASE_GPG_PASSPHRASE }}
+          GPG_KEY_ID: FF68AF59F8CEC835
+        run: |
+          set -euo pipefail
+          for f in dist/*; do
+            gpg --batch --yes --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" \
+              --local-user "$GPG_KEY_ID" --detach-sign --armor "$f"
+          done
+          cp SIGNING-KEY.asc dist/SIGNING-KEY.asc
 
       - name: Pubblica la GitHub Release
         uses: softprops/action-gh-release@v2
@@ -153,5 +176,14 @@ jobs:
             - **macOS**: `Sigillo-${{ steps.version.outputs.version }}-macOS.dmg` — apri il .dmg, trascina Sigillo nella cartella Applicazioni. Al primo avvio macOS avvisa che l'app viene da uno sviluppatore non identificato: tasto destro sull'app → Apri, per confermare che ti fidi.
             - **Windows**: `Sigillo-${{ steps.version.outputs.version }}-Windows.msi` — apri il file e segui l'installazione guidata.
             - **Linux**: `Sigillo-${{ steps.version.outputs.version }}-Linux.AppImage` — rendilo eseguibile prima di avviarlo (tasto destro → Proprietà → Permessi → "Consenti l'esecuzione del file come programma", oppure da terminale `chmod +x Sigillo-*.AppImage`), poi avvialo con doppio click.
+
+            ### Verificare l'autenticità del file scaricato (facoltativo)
+
+            Ogni pacchetto è accompagnato da una firma OpenPGP (stesso nome del file + `.asc`), realizzata con la chiave pubblica allegata a questa release (`SIGNING-KEY.asc`). Per verificare:
+
+            ```
+            gpg --import SIGNING-KEY.asc
+            gpg --verify Sigillo-${{ steps.version.outputs.version }}-macOS.dmg.asc Sigillo-${{ steps.version.outputs.version }}-macOS.dmg
+            ```
 
             ---

@@ -243,7 +243,9 @@ sempre iniziare con la `v`). Il push del tag fa partire automaticamente
 1. builda Sigillo su macOS, Windows e Linux;
 2. sincronizza da solo il numero di versione dentro l'app col tag (non va
    aggiornato a mano in nessun file);
-3. pubblica una [GitHub
+3. firma ogni pacchetto con la chiave OpenPGP del progetto (vedi
+   [Verificare l'autenticità di un file scaricato](#verificare-lautenticità-di-un-file-scaricato));
+4. pubblica una [GitHub
    Release](https://github.com/BitcoinReport/sigillo/releases) con tre
    file installabili allegati, con nomi chiari:
    `Sigillo-0.2.0-macOS.dmg`, `Sigillo-0.2.0-Windows.msi`,
@@ -253,6 +255,12 @@ sempre iniziare con la `v`). Il push del tag fa partire automaticamente
 
 L'intero processo richiede circa 5 minuti. Lo stato si può seguire da
 `https://github.com/BitcoinReport/sigillo/actions`.
+
+La firma richiede due secret già configurati nelle impostazioni del
+repository GitHub (Settings → Secrets and variables → Actions):
+`RELEASE_GPG_PRIVATE_KEY` (la chiave privata) e `RELEASE_GPG_PASSPHRASE`
+(la passphrase che la protegge). Non vanno mai toccati salvo cambio di
+chiave.
 
 ### Link di download stabili (per il sito web)
 
@@ -277,6 +285,23 @@ C'è anche un link, sempre stabile, alla pagina della release più recente
 ```
 https://github.com/BitcoinReport/sigillo/releases/latest
 ```
+
+### Verificare l'autenticità di un file scaricato
+
+Ogni release include, per ciascun pacchetto, una firma OpenPGP separata
+(stesso nome del file con `.asc` in più) e la chiave pubblica usata per
+firmare (`SIGNING-KEY.asc`, presente in questo repository e allegata a
+ogni release). Per verificare che un file scaricato sia autentico e non
+sia stato alterato:
+
+```bash
+gpg --import SIGNING-KEY.asc
+gpg --verify Sigillo-macOS.dmg.asc Sigillo-macOS.dmg
+```
+
+Se la firma è valida, gpg mostra "Firma corretta" (o "Good signature")
+seguita dall'identità del firmatario. Questo passaggio è facoltativo:
+chi non ha gpg installato può scaricare e usare i pacchetti normalmente.
 
 ## Testare solo il core crittografico (senza aprire l'app)
 
