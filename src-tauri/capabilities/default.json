@@ -10,6 +10,8 @@
     "fs:default",
     "fs:allow-write-text-file",
     "fs:allow-read-text-file",
+    "fs:allow-write-file",
+    "fs:allow-read-file",
     "clipboard-manager:allow-write-text",
     "clipboard-manager:allow-read-text"
   ]

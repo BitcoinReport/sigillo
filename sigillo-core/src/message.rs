@@ -1,4 +1,4 @@
-//! Cifratura e decifratura dei messaggi.
+//! Cifratura e decifratura dei messaggi: testo e file binari (immagini).
 
 use std::cell::RefCell;
 use std::io::Write;
@@ -8,26 +8,34 @@ use anyhow::{Context, Result};
 
 use sequoia_openpgp as openpgp;
 use openpgp::crypto::SessionKey;
-use openpgp::packet::{PKESK, SKESK};
+use openpgp::packet::{Packet, PKESK, SKESK};
 use openpgp::parse::stream::{
     DecryptionHelper, DecryptorBuilder, GoodChecksum, MessageLayer, MessageStructure,
     VerificationHelper,
 };
-use openpgp::parse::Parse;
+use openpgp::parse::{PacketParser, Parse};
 use openpgp::policy::StandardPolicy;
 use openpgp::serialize::stream::{Armorer, Encryptor2, LiteralWriter, Message, Signer};
-use openpgp::types::SymmetricAlgorithm;
+use openpgp::types::{DataFormat, SymmetricAlgorithm};
 use openpgp::{Cert, Fingerprint, KeyHandle};
 
-/// Cifra `plaintext` per uno o più destinatari, con firma opzionale del
-/// mittente. Restituisce il messaggio in formato ASCII armored (.asc),
-/// testo puro leggibile e riconoscibile su qualsiasi client OpenPGP.
-pub fn encrypt(
+/// Cifra byte grezzi (testo o binario, ad es. un'immagine) per uno o più
+/// destinatari, con firma opzionale del mittente.
+///
+/// `filename`, se presente, viene incorporato nel messaggio OpenPGP stesso
+/// (campo standard del pacchetto "dati letterali"): chi decifra lo
+/// ritrova come nome suggerito per il file, e il contenuto viene marcato
+/// come binario invece che testo. `armor` sceglie tra output ASCII
+/// armored (`.asc`, testo puro, ~33% più pesante) e binario compatto
+/// (`.gpg`).
+pub fn encrypt_bytes(
     sender: &Cert,
     recipients: &[Cert],
-    plaintext: &str,
+    data: &[u8],
+    filename: Option<&str>,
     sign: bool,
-) -> Result<String> {
+    armor: bool,
+) -> Result<Vec<u8>> {
     let p = &StandardPolicy::new();
 
     let mut recipient_keys = Vec::new();
@@ -58,7 +66,11 @@ pub fn encrypt(
     let mut sink = Vec::new();
     {
         let message = Message::new(&mut sink);
-        let message = Armorer::new(message).build()?;
+        let message: Message = if armor {
+            Armorer::new(message).build()?
+        } else {
+            message
+        };
         let message = Encryptor2::for_recipients(message, recipient_keys).build()?;
 
         let message = if sign {
@@ -81,12 +93,27 @@ pub fn encrypt(
             message
         };
 
-        let mut message = LiteralWriter::new(message).build()?;
-        message.write_all(plaintext.as_bytes())?;
+        let mut literal = LiteralWriter::new(message);
+        literal = if let Some(name) = filename {
+            literal.filename(name).context("nome file non valido")?.format(DataFormat::Binary)
+        } else {
+            literal.format(DataFormat::Unicode)
+        };
+        let mut message = literal.build()?;
+        message.write_all(data)?;
         message.finalize()?;
     }
 
-    String::from_utf8(sink).context("errore interno: output cifrato non valido")
+    Ok(sink)
+}
+
+/// Cifra `plaintext` per uno o più destinatari, con firma opzionale del
+/// mittente. Restituisce sempre il messaggio in formato ASCII armored
+/// (.asc): per il testo non è prevista alcuna scelta di formato, a
+/// differenza delle immagini (vedi [`encrypt_bytes`]).
+pub fn encrypt(sender: &Cert, recipients: &[Cert], plaintext: &str, sign: bool) -> Result<String> {
+    let bytes = encrypt_bytes(sender, recipients, plaintext.as_bytes(), None, sign, true)?;
+    String::from_utf8(bytes).context("errore interno: output cifrato non valido")
 }
 
 /// Esito della verifica della firma di un messaggio decifrato.
@@ -107,11 +134,22 @@ pub struct DecryptedMessage {
     pub signature: SignatureStatus,
 }
 
+/// Come [`DecryptedMessage`], ma per contenuto binario (es. un'immagine):
+/// niente conversione a testo, e il nome file originale se il mittente lo
+/// aveva incluso (impostato automaticamente da [`encrypt_bytes`]).
+#[derive(Debug, Clone)]
+pub struct DecryptedBytes {
+    pub data: Vec<u8>,
+    pub filename: Option<String>,
+    pub signature: SignatureStatus,
+}
+
 struct Helper<'a> {
     identity: &'a Cert,
     contacts: &'a [Cert],
     found_matching_key: Rc<RefCell<bool>>,
     signature: SignatureStatus,
+    filename: Option<String>,
 }
 
 impl<'a> VerificationHelper for Helper<'a> {
@@ -139,6 +177,15 @@ impl<'a> VerificationHelper for Helper<'a> {
                         }
                     }
                 }
+            }
+        }
+        Ok(())
+    }
+
+    fn inspect(&mut self, pp: &PacketParser) -> Result<()> {
+        if let Packet::Literal(lit) = &pp.packet {
+            if let Some(name) = lit.filename() {
+                self.filename = Some(String::from_utf8_lossy(name).into_owned());
             }
         }
         Ok(())
@@ -196,10 +243,11 @@ impl<'a> DecryptionHelper for Helper<'a> {
     }
 }
 
-/// Decifra un messaggio ASCII-armored, verificando anche l'eventuale
-/// firma del mittente. `contacts` è l'elenco delle chiavi pubbliche note
-/// (la rubrica), usato per verificare le firme.
-pub fn decrypt(identity: &Cert, contacts: &[Cert], armored: &str) -> Result<DecryptedMessage> {
+fn decrypt_raw(
+    identity: &Cert,
+    contacts: &[Cert],
+    input: &[u8],
+) -> Result<(Vec<u8>, Option<String>, SignatureStatus)> {
     let p = &StandardPolicy::new();
     let found_matching_key = Rc::new(RefCell::new(false));
 
@@ -208,10 +256,11 @@ pub fn decrypt(identity: &Cert, contacts: &[Cert], armored: &str) -> Result<Decr
         contacts,
         found_matching_key: found_matching_key.clone(),
         signature: SignatureStatus::Unsigned,
+        filename: None,
     };
 
-    let mut decryptor = DecryptorBuilder::from_bytes(armored.as_bytes())
-        .context("il testo incollato non è un messaggio OpenPGP valido, o è danneggiato")?
+    let mut decryptor = DecryptorBuilder::from_bytes(input)
+        .context("il contenuto non è un messaggio OpenPGP valido, o è danneggiato")?
         .with_policy(p, None, helper)
         .map_err(|_| {
             if *found_matching_key.borrow() {
@@ -225,12 +274,34 @@ pub fn decrypt(identity: &Cert, contacts: &[Cert], armored: &str) -> Result<Decr
             }
         })?;
 
-    let mut plaintext = String::new();
-    std::io::Read::read_to_string(&mut decryptor, &mut plaintext)
-        .context("il contenuto decifrato non è testo leggibile")?;
+    let mut data = Vec::new();
+    std::io::Read::read_to_end(&mut decryptor, &mut data)
+        .context("errore durante la lettura del contenuto decifrato")?;
 
-    let signature = decryptor.into_helper().signature;
+    let helper = decryptor.into_helper();
+    Ok((data, helper.filename, helper.signature))
+}
 
+/// Decifra un contenuto binario (es. un'immagine cifrata), verificando
+/// anche l'eventuale firma del mittente. Accetta sia input ASCII
+/// armored (.asc) sia binario (.gpg): Sequoia riconosce automaticamente
+/// il formato.
+pub fn decrypt_bytes(identity: &Cert, contacts: &[Cert], input: &[u8]) -> Result<DecryptedBytes> {
+    let (data, filename, signature) = decrypt_raw(identity, contacts, input)?;
+    Ok(DecryptedBytes {
+        data,
+        filename,
+        signature,
+    })
+}
+
+/// Decifra un messaggio di testo ASCII-armored, verificando anche
+/// l'eventuale firma del mittente. `contacts` è l'elenco delle chiavi
+/// pubbliche note (la rubrica), usato per verificare le firme.
+pub fn decrypt(identity: &Cert, contacts: &[Cert], armored: &str) -> Result<DecryptedMessage> {
+    let (data, _filename, signature) = decrypt_raw(identity, contacts, armored.as_bytes())?;
+    let plaintext =
+        String::from_utf8(data).context("il contenuto decifrato non è testo leggibile")?;
     Ok(DecryptedMessage {
         plaintext,
         signature,

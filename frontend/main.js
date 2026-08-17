@@ -1,12 +1,42 @@
 const { invoke } = window.__TAURI__.core;
 const { save, open } = window.__TAURI__.dialog;
-const { writeTextFile, readTextFile } = window.__TAURI__.fs;
+const { writeTextFile, writeFile, readFile } = window.__TAURI__.fs;
 const { writeText } = window.__TAURI__.clipboardManager;
+const { getCurrentWebview } = window.__TAURI__.webview;
 
 /** @type {{name: string, key: string, fingerprintHex: string, fingerprintWords: string[]}[]} */
 const contacts = [];
 let currentIdentity = null;
 let pendingSeedWords = [];
+let currentImageFormat = "asc";
+
+// Immagine allegata nella scheda "Scrivi", in attesa di essere cifrata.
+let attachedImagePath = null;
+let attachedImagePreviewUrl = null;
+
+// Ultimo risultato di una decifratura non testuale (immagine o file
+// generico), tenuto pronto per il bottone "Salva...".
+let lastDecrypted = null; // { bytes: Uint8Array, filename: string | null }
+
+const IMAGE_MIME_BY_EXTENSION = {
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  png: "image/png",
+  heic: "image/heic",
+  heif: "image/heif",
+};
+
+function guessImageMime(filename) {
+  const ext = (filename || "").split(".").pop().toLowerCase();
+  return IMAGE_MIME_BY_EXTENSION[ext] || null;
+}
+
+function base64ToBytes(base64) {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
 
 // ---------- Stato applicativo: una sola vista visibile alla volta ----------
 //
@@ -80,6 +110,12 @@ async function renderIdentity(view) {
     setError("contact-error", String(err));
   }
   renderContactList();
+
+  try {
+    currentImageFormat = await invoke("get_image_format");
+  } catch (err) {
+    currentImageFormat = "asc";
+  }
 }
 
 function renderSeedGrid(words) {
@@ -164,6 +200,8 @@ function resetAppToFirstRunState() {
   pendingSeedWords = [];
   contacts.length = 0;
   renderContactList();
+  clearAttachedImage();
+  lastDecrypted = null;
   document.getElementById("btn-open-advanced").hidden = true;
   document.getElementById("display-name").value = "";
   document.getElementById("import-display-name").value = "";
@@ -173,6 +211,87 @@ function resetAppToFirstRunState() {
   document.getElementById("ciphertext-out").value = "";
   document.getElementById("message-text").value = "";
 }
+
+// ---------- Immagine allegata (scheda "Scrivi") ----------
+
+async function setAttachedImage(path) {
+  const filename = path.split(/[\\/]/).pop();
+  const mime = guessImageMime(filename);
+  if (!mime) {
+    setError("encrypt-error", "Formato non supportato: usa un'immagine JPG, PNG o HEIC.");
+    return;
+  }
+  setError("encrypt-error", null);
+
+  let bytes;
+  try {
+    bytes = await readFile(path);
+  } catch (err) {
+    setError("encrypt-error", String(err));
+    return;
+  }
+
+  if (attachedImagePreviewUrl) URL.revokeObjectURL(attachedImagePreviewUrl);
+  attachedImagePreviewUrl = URL.createObjectURL(new Blob([bytes], { type: mime }));
+  attachedImagePath = path;
+
+  const img = document.getElementById("image-preview");
+  const unsupported = document.getElementById("image-preview-unsupported");
+  img.onload = () => {
+    img.hidden = false;
+    unsupported.hidden = true;
+  };
+  img.onerror = () => {
+    img.hidden = true;
+    unsupported.hidden = false;
+  };
+  img.src = attachedImagePreviewUrl;
+  document.getElementById("image-preview-name").textContent = filename;
+  document.getElementById("image-preview-wrap").hidden = false;
+  document.getElementById("image-dropzone-prompt").hidden = true;
+}
+
+function clearAttachedImage() {
+  if (attachedImagePreviewUrl) {
+    URL.revokeObjectURL(attachedImagePreviewUrl);
+    attachedImagePreviewUrl = null;
+  }
+  attachedImagePath = null;
+  document.getElementById("image-preview-wrap").hidden = true;
+  document.getElementById("image-dropzone-prompt").hidden = false;
+}
+
+document.getElementById("btn-choose-image").addEventListener("click", async () => {
+  const path = await open({
+    multiple: false,
+    filters: [{ name: "Immagini", extensions: ["jpg", "jpeg", "png", "heic", "heif"] }],
+  });
+  if (path) await setAttachedImage(path);
+});
+
+document.getElementById("btn-remove-image").addEventListener("click", () => {
+  clearAttachedImage();
+});
+
+// Il drag&drop nativo di Tauri e' a livello di finestra (da' percorsi
+// file, non oggetti File del browser): accettiamo un file solo quando la
+// scheda "Scrivi" e' quella attiva, per non "rubare" un drop destinato ad
+// altre parti dell'app.
+getCurrentWebview().onDragDropEvent((event) => {
+  const dropzone = document.getElementById("image-dropzone");
+  if (event.payload.type === "over") {
+    if (document.getElementById("tab-write").classList.contains("active")) {
+      dropzone.classList.add("dragover");
+    }
+    return;
+  }
+  dropzone.classList.remove("dragover");
+  if (event.payload.type !== "drop") return;
+  if (!document.getElementById("tab-write").classList.contains("active")) return;
+
+  const path = event.payload.paths[0];
+  if (path) setAttachedImage(path);
+});
 
 // ---------- Avvio: identità già presente su questo dispositivo? ----------
 
@@ -391,6 +510,7 @@ document.getElementById("sign-message").addEventListener(
 document.getElementById("btn-encrypt").addEventListener("click", async (e) => {
   setError("encrypt-error", null);
   document.getElementById("encrypt-result").hidden = true;
+  document.getElementById("encrypt-image-result").hidden = true;
 
   const selected = [...document.querySelectorAll('#recipient-list input[type="checkbox"]:checked')]
     .map((el) => contacts[Number(el.value)].key);
@@ -401,17 +521,42 @@ document.getElementById("btn-encrypt").addEventListener("click", async (e) => {
     setError("encrypt-error", "Seleziona almeno un destinatario.");
     return;
   }
-  if (!plaintext) {
-    setError("encrypt-error", "Scrivi un messaggio prima di cifrarlo.");
+  if (!plaintext && !attachedImagePath) {
+    setError("encrypt-error", "Scrivi un messaggio o allega un'immagine prima di cifrare.");
     return;
   }
 
   try {
-    const ciphertext = await withLoading(e.currentTarget, () =>
-      invoke("encrypt_message", { recipientsArmored: selected, plaintext, sign })
-    );
-    document.getElementById("ciphertext-out").value = ciphertext;
-    document.getElementById("encrypt-result").hidden = false;
+    await withLoading(e.currentTarget, async () => {
+      if (plaintext) {
+        const ciphertext = await invoke("encrypt_message", {
+          recipientsArmored: selected,
+          plaintext,
+          sign,
+        });
+        document.getElementById("ciphertext-out").value = ciphertext;
+        document.getElementById("encrypt-result").hidden = false;
+      }
+
+      if (attachedImagePath) {
+        const sourceName = attachedImagePath.split(/[\\/]/).pop();
+        const ext = currentImageFormat === "gpg" ? "gpg" : "asc";
+        const outputPath = await save({
+          defaultPath: `${sourceName}.${ext}`,
+          filters: [{ name: "Immagine cifrata", extensions: [ext] }],
+        });
+        if (outputPath) {
+          await invoke("encrypt_image", {
+            recipientsArmored: selected,
+            sourcePath: attachedImagePath,
+            outputPath,
+            sign,
+          });
+          document.getElementById("encrypt-image-saved-path").textContent = outputPath;
+          document.getElementById("encrypt-image-result").hidden = false;
+        }
+      }
+    });
   } catch (err) {
     setError("encrypt-error", String(err));
   }
@@ -433,14 +578,75 @@ document.getElementById("btn-save-ciphertext").addEventListener("click", async (
 
 // ---------- Decifra ----------
 
-document.getElementById("btn-load-file").addEventListener("click", async () => {
+function renderDecryptResult(result) {
+  lastDecrypted = null;
+
+  const statusEl = document.getElementById("signature-status");
+  statusEl.className = "signature-status";
+  if (result.signature_status === "verificata") {
+    const known = contacts.find((c) => c.fingerprintHex === result.signer_fingerprint);
+    statusEl.textContent = known
+      ? `Firma verificata: è di ${known.name}.`
+      : `Firma verificata (${result.signer_fingerprint}), ma questo contatto non è in rubrica.`;
+    statusEl.classList.add("verified");
+  } else if (result.signature_status === "non_verificabile") {
+    statusEl.textContent =
+      "Il messaggio è firmato, ma non conosci ancora la chiave di chi l'ha firmato: aggiungilo in rubrica per verificarlo.";
+    statusEl.classList.add("unverifiable");
+  } else {
+    statusEl.textContent = "Messaggio non firmato.";
+    statusEl.classList.add("unsigned");
+  }
+
+  const textBlock = document.getElementById("decrypt-result-text");
+  const imageBlock = document.getElementById("decrypt-result-image");
+  const fileBlock = document.getElementById("decrypt-result-file");
+  textBlock.hidden = true;
+  imageBlock.hidden = true;
+  fileBlock.hidden = true;
+
+  if (result.kind === "testo") {
+    document.getElementById("plaintext-out").value = result.plaintext;
+    textBlock.hidden = false;
+  } else if (result.kind === "immagine") {
+    const bytes = base64ToBytes(result.image_data_base64);
+    lastDecrypted = { bytes, filename: result.filename };
+
+    const img = document.getElementById("decrypt-image-preview");
+    const unsupported = document.getElementById("decrypt-image-unsupported");
+    img.onload = () => {
+      img.hidden = false;
+      unsupported.hidden = true;
+    };
+    img.onerror = () => {
+      img.hidden = true;
+      unsupported.hidden = false;
+    };
+    img.src = `data:${result.image_mime};base64,${result.image_data_base64}`;
+    imageBlock.hidden = false;
+  } else {
+    lastDecrypted = { bytes: base64ToBytes(result.image_data_base64), filename: result.filename };
+    fileBlock.hidden = false;
+  }
+
+  document.getElementById("decrypt-result").hidden = false;
+}
+
+document.getElementById("btn-load-file").addEventListener("click", async (e) => {
+  setError("decrypt-error", null);
   const path = await open({
     multiple: false,
-    filters: [{ name: "Messaggio cifrato", extensions: ["asc", "pgp", "txt"] }],
+    filters: [{ name: "Messaggio cifrato", extensions: ["asc", "gpg", "pgp", "txt"] }],
   });
-  if (path) {
-    const contents = await readTextFile(path);
-    document.getElementById("ciphertext-in").value = contents;
+  if (!path) return;
+
+  try {
+    const result = await withLoading(e.currentTarget, () =>
+      invoke("decrypt_file", { contactsArmored: contacts.map((c) => c.key), path })
+    );
+    renderDecryptResult(result);
+  } catch (err) {
+    setError("decrypt-error", String(err));
   }
 });
 
@@ -458,29 +664,25 @@ document.getElementById("btn-decrypt").addEventListener("click", async (e) => {
     const result = await withLoading(e.currentTarget, () =>
       invoke("decrypt_message", { contactsArmored: contacts.map((c) => c.key), ciphertext })
     );
-    document.getElementById("plaintext-out").value = result.plaintext;
-
-    const statusEl = document.getElementById("signature-status");
-    statusEl.className = "signature-status";
-    if (result.signature_status === "verificata") {
-      const known = contacts.find((c) => c.fingerprintHex === result.signer_fingerprint);
-      statusEl.textContent = known
-        ? `Firma verificata: è di ${known.name}.`
-        : `Firma verificata (${result.signer_fingerprint}), ma questo contatto non è in rubrica.`;
-      statusEl.classList.add("verified");
-    } else if (result.signature_status === "non_verificabile") {
-      statusEl.textContent =
-        "Il messaggio è firmato, ma non conosci ancora la chiave di chi l'ha firmato: aggiungilo in rubrica per verificarlo.";
-      statusEl.classList.add("unverifiable");
-    } else {
-      statusEl.textContent = "Messaggio non firmato.";
-      statusEl.classList.add("unsigned");
-    }
-
-    document.getElementById("decrypt-result").hidden = false;
+    renderDecryptResult(result);
   } catch (err) {
     setError("decrypt-error", String(err));
   }
+});
+
+async function saveLastDecrypted(defaultName) {
+  if (!lastDecrypted) return;
+  const suggested = lastDecrypted.filename || defaultName;
+  const path = await save({ defaultPath: suggested });
+  if (path) await writeFile(path, lastDecrypted.bytes);
+}
+
+document.getElementById("btn-save-decrypted-image").addEventListener("click", () => {
+  saveLastDecrypted("immagine-decifrata");
+});
+
+document.getElementById("btn-save-decrypted-file").addEventListener("click", () => {
+  saveLastDecrypted("file-decifrato");
 });
 
 // ---------- Identita ----------
@@ -532,6 +734,11 @@ async function populateAdvancedScreen() {
     myDetails.innerHTML = `<p class="error">${String(err)}</p>`;
   }
 
+  const formatRadio = document.querySelector(
+    `input[name="image-format"][value="${currentImageFormat}"]`
+  );
+  if (formatRadio) formatRadio.checked = true;
+
   const contactsContainer = document.getElementById("adv-contacts");
   contactsContainer.innerHTML = "";
   if (contacts.length === 0) {
@@ -579,6 +786,19 @@ document.getElementById("btn-open-advanced").addEventListener("click", async (e)
 document.getElementById("btn-close-advanced").addEventListener("click", () => {
   setView("screen-main");
 });
+
+for (const radio of document.querySelectorAll('input[name="image-format"]')) {
+  radio.addEventListener("change", async () => {
+    setError("image-format-error", null);
+    const format = radio.value;
+    try {
+      await invoke("set_image_format", { format });
+      currentImageFormat = format;
+    } catch (err) {
+      setError("image-format-error", String(err));
+    }
+  });
+}
 
 document.getElementById("btn-export-tsk").addEventListener("click", async (e) => {
   setError("export-tsk-error", null);

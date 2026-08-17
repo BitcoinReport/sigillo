@@ -185,8 +185,25 @@
             <p class="hint">Nessun contatto ancora — aggiungine uno dalla scheda "Rubrica" quando vuoi scrivere a qualcuno in modo cifrato.</p>
           </div>
 
-          <label for="message-text">Messaggio</label>
+          <label for="message-text">Messaggio (facoltativo se alleghi un'immagine)</label>
           <textarea id="message-text" rows="8" placeholder="Scrivi qui il tuo messaggio..."></textarea>
+
+          <label>Immagine (facoltativa)</label>
+          <div id="image-dropzone" class="dropzone">
+            <div id="image-dropzone-prompt">
+              <p class="hint">Trascina qui una foto (JPG, PNG o HEIC), oppure</p>
+              <button id="btn-choose-image" class="secondary" type="button">Scegli immagine...</button>
+            </div>
+            <div id="image-preview-wrap" hidden>
+              <img id="image-preview" alt="Anteprima dell'immagine allegata" />
+              <p id="image-preview-unsupported" class="hint" hidden>
+                Non riesco a mostrare l'anteprima di questo formato, ma il
+                file verrà comunque cifrato correttamente.
+              </p>
+              <p id="image-preview-name" class="hint"></p>
+              <button id="btn-remove-image" class="secondary" type="button">Rimuovi immagine</button>
+            </div>
+          </div>
 
           <label class="checkbox-row">
             <input type="checkbox" id="sign-message" />
@@ -210,6 +227,11 @@
             </div>
           </div>
 
+          <div id="encrypt-image-result" class="reveal-panel" hidden>
+            <p>Immagine cifrata salvata:</p>
+            <p id="encrypt-image-saved-path" class="fingerprint-hex"></p>
+          </div>
+
           <p id="encrypt-error" class="error" hidden></p>
         </div>
       </div>
@@ -226,8 +248,32 @@
 
           <div id="decrypt-result" hidden>
             <p id="signature-status" class="signature-status"></p>
-            <label for="plaintext-out">Messaggio in chiaro</label>
-            <textarea id="plaintext-out" rows="8" readonly></textarea>
+
+            <div id="decrypt-result-text">
+              <label for="plaintext-out">Messaggio in chiaro</label>
+              <textarea id="plaintext-out" rows="8" readonly></textarea>
+            </div>
+
+            <div id="decrypt-result-image" hidden>
+              <img id="decrypt-image-preview" alt="Immagine decifrata" />
+              <p id="decrypt-image-unsupported" class="hint" hidden>
+                Non riesco a mostrare l'anteprima di questo formato, ma
+                puoi comunque salvare il file.
+              </p>
+              <div class="button-row">
+                <button id="btn-save-decrypted-image" class="secondary">Salva immagine...</button>
+              </div>
+            </div>
+
+            <div id="decrypt-result-file" hidden>
+              <p class="hint">
+                Hai ricevuto un file cifrato che non è testo né
+                un'immagine riconosciuta, ma puoi comunque salvarlo.
+              </p>
+              <div class="button-row">
+                <button id="btn-save-decrypted-file" class="secondary">Salva file...</button>
+              </div>
+            </div>
           </div>
 
           <p id="decrypt-error" class="error" hidden></p>
@@ -299,6 +345,36 @@
 
         <h3>Contatti in rubrica</h3>
         <div id="adv-contacts" class="tech-details"></div>
+
+        <hr />
+
+        <h3>Formato di cifratura per le immagini</h3>
+        <p class="hint">
+          Riguarda solo le immagini: i messaggi di testo restano sempre
+          nel formato standard leggibile.
+        </p>
+        <div class="word-count-choice">
+          <label>
+            <input type="radio" name="image-format" value="asc" checked />
+            .asc (consigliato)
+          </label>
+          <label>
+            <input type="radio" name="image-format" value="gpg" />
+            .gpg
+          </label>
+        </div>
+        <p class="hint">
+          <strong>.asc</strong>: formato standard, leggibile come testo,
+          compatibile con qualsiasi programma OpenPGP. File leggermente
+          più pesante (circa un terzo in più del file originale).
+        </p>
+        <p class="hint">
+          <strong>.gpg</strong>: formato compatto (nessun aumento di peso
+          del file), ma meno immediato da riconoscere per chi non ha
+          familiarità con la crittografia. Scegli questa opzione solo se
+          sai già cosa significa.
+        </p>
+        <p id="image-format-error" class="error" hidden></p>
 
         <hr />
 

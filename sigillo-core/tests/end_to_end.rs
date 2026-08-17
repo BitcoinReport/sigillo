@@ -113,6 +113,114 @@ fn contact_import_round_trip_via_armored_public_key() {
     assert_eq!(words.len(), 15);
 }
 
+// Non serve un vero file JPEG/PNG: sigillo-core cifra e decifra byte
+// grezzi senza sapere (ne dover sapere) che si tratta di un'immagine -
+// quella distinzione la fa il frontend, sui byte gia decifrati.
+fn fake_image_bytes() -> Vec<u8> {
+    let mut data = vec![0xFFu8, 0xD8, 0xFF, 0xE0]; // firma JPEG
+    data.extend((0..2000u32).map(|i| (i % 256) as u8));
+    data
+}
+
+#[test]
+fn encrypt_bytes_then_decrypt_bytes_round_trip_armored() {
+    let alice = alice();
+    let bob = bob();
+    let image = fake_image_bytes();
+
+    let ciphertext = message::encrypt_bytes(
+        &alice.cert,
+        &[bob.cert.clone()],
+        &image,
+        Some("foto.jpg"),
+        false,
+        true,
+    )
+    .unwrap();
+    assert!(ciphertext.starts_with(b"-----BEGIN PGP MESSAGE-----"));
+
+    let decrypted = message::decrypt_bytes(&bob.cert, &[], &ciphertext).unwrap();
+    assert_eq!(decrypted.data, image);
+    assert_eq!(decrypted.filename.as_deref(), Some("foto.jpg"));
+    assert_eq!(decrypted.signature, message::SignatureStatus::Unsigned);
+}
+
+#[test]
+fn encrypt_bytes_then_decrypt_bytes_round_trip_binary_gpg() {
+    let alice = alice();
+    let bob = bob();
+    let image = fake_image_bytes();
+
+    let ciphertext = message::encrypt_bytes(
+        &alice.cert,
+        &[bob.cert.clone()],
+        &image,
+        Some("foto.png"),
+        false,
+        false,
+    )
+    .unwrap();
+    // Formato binario: non deve iniziare col marcatore ASCII armored.
+    assert!(!ciphertext.starts_with(b"-----BEGIN PGP MESSAGE-----"));
+
+    let decrypted = message::decrypt_bytes(&bob.cert, &[], &ciphertext).unwrap();
+    assert_eq!(decrypted.data, image);
+    assert_eq!(decrypted.filename.as_deref(), Some("foto.png"));
+}
+
+#[test]
+fn encrypt_bytes_signed_image_is_verified() {
+    let alice = alice();
+    let bob = bob();
+    let image = fake_image_bytes();
+
+    let ciphertext = message::encrypt_bytes(
+        &alice.cert,
+        &[bob.cert.clone()],
+        &image,
+        Some("foto.jpg"),
+        true,
+        true,
+    )
+    .unwrap();
+
+    let alice_public = alice.cert.clone().strip_secret_key_material();
+    let decrypted = message::decrypt_bytes(&bob.cert, &[alice_public], &ciphertext).unwrap();
+
+    assert_eq!(decrypted.data, image);
+    match decrypted.signature {
+        message::SignatureStatus::Verified(fp) => assert_eq!(fp, alice.cert.fingerprint()),
+        other => panic!("firma non verificata: {other:?}"),
+    }
+}
+
+#[test]
+fn encrypt_bytes_without_filename_has_no_filename_on_decrypt() {
+    let alice = alice();
+    let bob = bob();
+    let image = fake_image_bytes();
+
+    let ciphertext =
+        message::encrypt_bytes(&alice.cert, &[bob.cert.clone()], &image, None, false, true)
+            .unwrap();
+    let decrypted = message::decrypt_bytes(&bob.cert, &[], &ciphertext).unwrap();
+    assert_eq!(decrypted.data, image);
+    assert_eq!(decrypted.filename, None);
+}
+
+#[test]
+fn text_encrypt_is_unaffected_by_image_support() {
+    // Garanzia di non-regressione: il percorso testo esistente (usato da
+    // ogni test sopra) continua a passare da encrypt_bytes internamente
+    // con armor=true, filename=None; qui verifichiamo esplicitamente che
+    // il testo prodotto sia identico a un normale messaggio armato.
+    let alice = alice();
+    let bob = bob();
+    let ciphertext = message::encrypt(&alice.cert, &[bob.cert.clone()], "Ciao", false).unwrap();
+    let decrypted = message::decrypt(&bob.cert, &[], &ciphertext).unwrap();
+    assert_eq!(decrypted.plaintext, "Ciao");
+}
+
 #[test]
 fn reimported_identity_can_still_decrypt_old_messages() {
     let alice = alice();

@@ -1,13 +1,15 @@
 use std::path::PathBuf;
 use std::sync::Mutex;
 
+use base64::Engine;
 use serde::Serialize;
 use tauri::{AppHandle, Manager, State};
 
-use sigillo_core::{contacts, identity, keyinfo, message, storage};
+use sigillo_core::{contacts, identity, keyinfo, message, settings, storage};
 
 const VAULT_FILE_NAME: &str = "identity.sigillo";
 const CONTACTS_FILE_NAME: &str = "contacts.json";
+const SETTINGS_FILE_NAME: &str = "settings.json";
 const MIN_PASSPHRASE_LEN: usize = 8;
 
 #[derive(Default)]
@@ -30,6 +32,14 @@ fn contacts_path(app: &AppHandle) -> Result<PathBuf, String> {
         .app_data_dir()
         .map_err(|e| format!("impossibile trovare la cartella dati dell'app: {e}"))?;
     Ok(dir.join(CONTACTS_FILE_NAME))
+}
+
+fn settings_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("impossibile trovare la cartella dati dell'app: {e}"))?;
+    Ok(dir.join(SETTINGS_FILE_NAME))
 }
 
 #[derive(Serialize)]
@@ -198,6 +208,32 @@ fn remove_identity_from_disk(app: AppHandle, state: State<AppState>) -> Result<(
     Ok(())
 }
 
+fn image_format_to_str(format: settings::ImageFormat) -> &'static str {
+    match format {
+        settings::ImageFormat::Asc => "asc",
+        settings::ImageFormat::Gpg => "gpg",
+    }
+}
+
+/// Formato di cifratura scelto per le immagini ("asc" o "gpg"). Il testo
+/// non ha questa scelta: è sempre ASCII armored.
+#[tauri::command]
+fn get_image_format(app: AppHandle) -> Result<String, String> {
+    let format =
+        settings::load_image_format(&settings_path(&app)?).map_err(|e| e.to_string())?;
+    Ok(image_format_to_str(format).to_string())
+}
+
+#[tauri::command]
+fn set_image_format(app: AppHandle, format: String) -> Result<(), String> {
+    let format = match format.as_str() {
+        "asc" => settings::ImageFormat::Asc,
+        "gpg" => settings::ImageFormat::Gpg,
+        _ => return Err("formato non valido: deve essere \"asc\" o \"gpg\"".to_string()),
+    };
+    settings::save_image_format(&settings_path(&app)?, format).map_err(|e| e.to_string())
+}
+
 #[derive(Serialize)]
 struct ContactView {
     name: String,
@@ -307,6 +343,14 @@ fn export_private_key_file(state: State<AppState>, password: String) -> Result<S
     identity::export_private_key_file(&id.cert, &password).map_err(|e| e.to_string())
 }
 
+fn recipients_from_armored(recipients_armored: &[String]) -> Result<Vec<sequoia_openpgp::Cert>, String> {
+    recipients_armored
+        .iter()
+        .map(|armored| contacts::import_public_key(armored.as_bytes()))
+        .collect::<anyhow::Result<_>>()
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 fn encrypt_message(
     state: State<AppState>,
@@ -318,23 +362,145 @@ fn encrypt_message(
     let id = guard
         .as_ref()
         .ok_or("genera o importa prima la tua identità")?;
-
-    let recipients: Vec<sequoia_openpgp::Cert> = recipients_armored
-        .iter()
-        .map(|armored| contacts::import_public_key(armored.as_bytes()))
-        .collect::<anyhow::Result<_>>()
-        .map_err(|e| e.to_string())?;
-
+    let recipients = recipients_from_armored(&recipients_armored)?;
     message::encrypt(&id.cert, &recipients, &plaintext, sign).map_err(|e| e.to_string())
+}
+
+/// Cifra un'immagine (o un altro file) leggendolo da `source_path` e
+/// scrivendo il risultato cifrato direttamente in `output_path`, senza
+/// far transitare i byte del file per il frontend: per un'immagine di
+/// alcuni MB è più veloce e non appesantisce l'interfaccia. Il nome
+/// originale del file viene incorporato nel messaggio OpenPGP, cosi chi
+/// decifra lo ritrova come nome suggerito. Il formato (.asc armato o
+/// .gpg binario) segue l'impostazione salvata in Avanzate.
+#[tauri::command]
+fn encrypt_image(
+    app: AppHandle,
+    state: State<AppState>,
+    recipients_armored: Vec<String>,
+    source_path: String,
+    output_path: String,
+    sign: bool,
+) -> Result<(), String> {
+    let guard = state.identity.lock().unwrap();
+    let id = guard
+        .as_ref()
+        .ok_or("genera o importa prima la tua identità")?;
+    let recipients = recipients_from_armored(&recipients_armored)?;
+
+    let data = std::fs::read(&source_path)
+        .map_err(|e| format!("impossibile leggere il file immagine: {e}"))?;
+    let filename = std::path::Path::new(&source_path)
+        .file_name()
+        .map(|f| f.to_string_lossy().into_owned());
+
+    let format =
+        settings::load_image_format(&settings_path(&app)?).map_err(|e| e.to_string())?;
+    let armor = format == settings::ImageFormat::Asc;
+
+    let ciphertext = message::encrypt_bytes(
+        &id.cert,
+        &recipients,
+        &data,
+        filename.as_deref(),
+        sign,
+        armor,
+    )
+    .map_err(|e| e.to_string())?;
+
+    std::fs::write(&output_path, &ciphertext)
+        .map_err(|e| format!("impossibile salvare il file cifrato: {e}"))?;
+
+    Ok(())
+}
+
+/// Riconosce se `data` è un'immagine nei formati comuni guardando i
+/// primi byte (che non cambiano cifrando/decifrando), non l'estensione
+/// del file: funziona anche se il mittente ha usato un altro programma
+/// OpenPGP che non imposta il nome file.
+fn detect_image_mime(data: &[u8]) -> Option<&'static str> {
+    if data.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return Some("image/jpeg");
+    }
+    if data.starts_with(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) {
+        return Some("image/png");
+    }
+    if data.len() > 12 && &data[4..8] == b"ftyp" {
+        let brand = &data[8..12];
+        if matches!(
+            brand,
+            b"heic" | b"heix" | b"hevc" | b"heim" | b"heis" | b"hevm" | b"hevs" | b"mif1" | b"msf1"
+        ) {
+            return Some("image/heic");
+        }
+    }
+    None
 }
 
 #[derive(Serialize)]
 struct DecryptView {
-    plaintext: String,
+    /// "testo", "immagine" o "file" (contenuto binario non riconosciuto).
+    kind: String,
+    plaintext: Option<String>,
+    image_data_base64: Option<String>,
+    image_mime: Option<String>,
+    filename: Option<String>,
     signature_status: String,
     signer_fingerprint: Option<String>,
 }
 
+fn build_decrypt_view(
+    data: Vec<u8>,
+    filename: Option<String>,
+    signature: message::SignatureStatus,
+) -> DecryptView {
+    let (signature_status, signer_fingerprint) = match signature {
+        message::SignatureStatus::Unsigned => ("non_firmato".to_string(), None),
+        message::SignatureStatus::Verified(fp) => {
+            ("verificata".to_string(), Some(fp.to_spaced_hex()))
+        }
+        message::SignatureStatus::Unverifiable => ("non_verificabile".to_string(), None),
+    };
+
+    if let Some(mime) = detect_image_mime(&data) {
+        return DecryptView {
+            kind: "immagine".to_string(),
+            plaintext: None,
+            image_data_base64: Some(base64::engine::general_purpose::STANDARD.encode(&data)),
+            image_mime: Some(mime.to_string()),
+            filename,
+            signature_status,
+            signer_fingerprint,
+        };
+    }
+
+    if let Ok(text) = String::from_utf8(data.clone()) {
+        return DecryptView {
+            kind: "testo".to_string(),
+            plaintext: Some(text),
+            image_data_base64: None,
+            image_mime: None,
+            filename,
+            signature_status,
+            signer_fingerprint,
+        };
+    }
+
+    DecryptView {
+        kind: "file".to_string(),
+        plaintext: None,
+        image_data_base64: Some(base64::engine::general_purpose::STANDARD.encode(&data)),
+        image_mime: None,
+        filename,
+        signature_status,
+        signer_fingerprint,
+    }
+}
+
+/// Decifra un contenuto incollato come testo (funziona sia per un
+/// messaggio di testo sia per un'immagine cifrata in formato .asc: in
+/// entrambi i casi l'input è testo ASCII armored). Il tipo di contenuto
+/// reale (testo/immagine/file) è determinato dopo la decifratura.
 #[tauri::command]
 fn decrypt_message(
     state: State<AppState>,
@@ -345,29 +511,42 @@ fn decrypt_message(
     let id = guard
         .as_ref()
         .ok_or("genera o importa prima la tua identità")?;
+    let contacts_certs = recipients_from_armored(&contacts_armored)?;
 
-    let contacts_certs: Vec<sequoia_openpgp::Cert> = contacts_armored
-        .iter()
-        .map(|armored| contacts::import_public_key(armored.as_bytes()))
-        .collect::<anyhow::Result<_>>()
+    let decrypted = message::decrypt_bytes(&id.cert, &contacts_certs, ciphertext.as_bytes())
         .map_err(|e| e.to_string())?;
 
+    Ok(build_decrypt_view(
+        decrypted.data,
+        decrypted.filename,
+        decrypted.signature,
+    ))
+}
+
+/// Come [`decrypt_message`], ma leggendo l'input da un file su disco
+/// invece che da testo incollato: serve per i file .gpg (binari, non
+/// incollabili in una casella di testo).
+#[tauri::command]
+fn decrypt_file(
+    state: State<AppState>,
+    contacts_armored: Vec<String>,
+    path: String,
+) -> Result<DecryptView, String> {
+    let guard = state.identity.lock().unwrap();
+    let id = guard
+        .as_ref()
+        .ok_or("genera o importa prima la tua identità")?;
+    let contacts_certs = recipients_from_armored(&contacts_armored)?;
+
+    let input = std::fs::read(&path).map_err(|e| format!("impossibile leggere il file: {e}"))?;
     let decrypted =
-        message::decrypt(&id.cert, &contacts_certs, &ciphertext).map_err(|e| e.to_string())?;
+        message::decrypt_bytes(&id.cert, &contacts_certs, &input).map_err(|e| e.to_string())?;
 
-    let (signature_status, signer_fingerprint) = match decrypted.signature {
-        message::SignatureStatus::Unsigned => ("non_firmato".to_string(), None),
-        message::SignatureStatus::Verified(fp) => {
-            ("verificata".to_string(), Some(fp.to_spaced_hex()))
-        }
-        message::SignatureStatus::Unverifiable => ("non_verificabile".to_string(), None),
-    };
-
-    Ok(DecryptView {
-        plaintext: decrypted.plaintext,
-        signature_status,
-        signer_fingerprint,
-    })
+    Ok(build_decrypt_view(
+        decrypted.data,
+        decrypted.filename,
+        decrypted.signature,
+    ))
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -391,8 +570,12 @@ pub fn run() {
             my_technical_details,
             contact_technical_details,
             export_private_key_file,
+            get_image_format,
+            set_image_format,
             encrypt_message,
+            encrypt_image,
             decrypt_message,
+            decrypt_file,
         ])
         .run(tauri::generate_context!())
         .expect("errore durante l'avvio di Sigillo");
