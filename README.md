@@ -21,21 +21,21 @@ account o di un backup su un server. La derivazione è illustrata e testata in
 
 ```
 Sigillo/
-├── Cargo.toml               # workspace Rust
-├── sigillo-core/             # core crittografico, indipendente dalla UI
+├── Cargo.toml                # workspace Rust
+├── sigillo-core/              # core crittografico, indipendente dalla UI
 │   ├── src/
-│   │   ├── identity.rs       # seed BIP39 -> chiavi OpenPGP Ed25519/X25519
-│   │   ├── message.rs        # cifra / decifra (+ firma / verifica)
-│   │   ├── contacts.rs       # import chiave pubblica, fingerprint a parole
-│   │   ├── storage.rs        # identita cifrata a riposo sul dispositivo (vault)
-│   │   ├── keyinfo.rs        # dettagli tecnici di una chiave (sezione avanzate)
+│   │   ├── identity.rs        # seed BIP39 -> chiavi OpenPGP Ed25519/X25519
+│   │   ├── message.rs         # cifra / decifra (+ firma / verifica)
+│   │   ├── contacts.rs        # import chiave pubblica, fingerprint a parole, rubrica persistente
+│   │   ├── storage.rs         # identità cifrata a riposo sul dispositivo (vault)
+│   │   ├── keyinfo.rs         # dettagli tecnici di una chiave (sezione avanzate)
 │   │   └── lib.rs
-│   └── tests/end_to_end.rs   # test di integrazione (cifra->decifra, ecc.)
-├── src-tauri/                 # applicazione desktop (Tauri + Rust)
-│   ├── src/lib.rs             # comandi Tauri che espongono sigillo-core
+│   └── tests/end_to_end.rs    # test di integrazione (cifra->decifra, ecc.)
+├── src-tauri/                  # applicazione desktop (Tauri + Rust)
+│   ├── src/lib.rs              # comandi Tauri che espongono sigillo-core
 │   ├── tauri.conf.json
 │   └── Cargo.toml
-├── frontend/                  # UI: HTML/CSS/JS puri, nessun framework
+├── frontend/                   # UI: HTML/CSS/JS puri, nessun framework
 │   ├── index.html
 │   ├── main.js
 │   └── styles.css
@@ -48,37 +48,51 @@ toccano materiale segreto sono in `identity.rs` e sono le uniche a manipolare
 byte di chiave privata; usano [`zeroize`](https://docs.rs/zeroize) per
 azzerare quei buffer non appena non servono più.
 
-## Persistenza dell'identita sul dispositivo
+## Persistenza dell'identità sul dispositivo
 
-Al primo avvio, dopo aver generato o importato l'identita, l'app chiede di
+Al primo avvio, dopo aver generato o importato l'identità, l'app chiede di
 scegliere una **passphrase locale** (almeno 8 caratteri) e salva
-l'identita cifrata a riposo nella cartella dati dell'app (via
+l'identità cifrata a riposo nella cartella dati dell'app (via
 [`app_data_dir`](https://docs.rs/tauri/latest/tauri/path/struct.PathResolver.html#method.app_data_dir)
 di Tauri: su macOS `~/Library/Application Support/org.sigillo.app/`, su
 Linux `~/.local/share/org.sigillo.app/`, su Windows
 `%APPDATA%\org.sigillo.app\`).
 
-Agli avvii successivi l'app rileva il file gia presente e chiede solo
-quella passphrase locale, non piu la seed phrase. La passphrase locale e
-**diversa** dalla seed phrase: sblocca l'identita solo su questo
+Agli avvii successivi l'app rileva il file già presente e chiede solo
+quella passphrase locale, non più la seed phrase. La passphrase locale è
+**diversa** dalla seed phrase: sblocca l'identità solo su questo
 dispositivo, non permette di rigenerarla altrove (per quello serve sempre
 la seed phrase).
 
 Il file (`identity.sigillo`) non contiene mai la seed phrase in chiaro:
-e cifrato con Argon2id (derivazione della chiave dalla passphrase,
-resistente a attacchi a forza bruta) + AES-256-GCM (cifratura
+è cifrato con Argon2id (derivazione della chiave dalla passphrase,
+resistente ad attacchi a forza bruta) + AES-256-GCM (cifratura
 autenticata). I dettagli e i test — incluso un test che scandisce
-byte-per-byte il file salvato per assicurarsi che nessuna parola della
+byte per byte il file salvato per assicurarsi che nessuna parola della
 seed phrase compaia mai in chiaro — sono in
 [`sigillo-core/src/storage.rs`](sigillo-core/src/storage.rs).
 
 Dalla sezione **Avanzate** (icona ⚙ in alto a destra, una volta sbloccata
-l'app) si puo rimuovere l'identita salvata su questo computer: da quel
-momento l'app torna a comportarsi come al primo avvio, e per riusarla su
-questo dispositivo serve reimportare la seed phrase. La stessa opzione e
-disponibile anche dalla schermata di sblocco, per chi ha dimenticato la
-passphrase locale (la seed phrase resta l'unico vero backup: se si perde
-anche quella, l'identita non e recuperabile).
+l'app) si può rimuovere l'identità salvata su questo computer: da quel
+momento l'app torna a comportarsi come al primo avvio (rubrica compresa,
+vedi sotto), e per riusarla su questo dispositivo serve reimportare la
+seed phrase. La stessa opzione è disponibile anche dalla schermata di
+sblocco, per chi ha dimenticato la passphrase locale (la seed phrase
+resta l'unico vero backup: se si perde anche quella, l'identità non è
+recuperabile).
+
+### Rubrica
+
+Anche i contatti aggiunti in rubrica persistono sul dispositivo, nello
+stesso `app_data_dir`, in un file separato (`contacts.json`). A
+differenza della chiave privata dell'utente, le chiavi pubbliche dei
+contatti non sono materiale segreto: non serve cifrarle, ma vengono
+comunque scritte su disco con lo stesso schema "file temporaneo + rename
+atomico" usato per il vault dell'identità, così un crash a metà scrittura
+non lascia una rubrica troncata. Rimuovere l'identità dal dispositivo
+(vedi sopra) cancella anche la rubrica, coerentemente col tornare allo
+stato di primo avvio. Dettagli e test in
+[`sigillo-core/src/contacts.rs`](sigillo-core/src/contacts.rs).
 
 ## Sezione "Avanzate"
 
@@ -87,15 +101,15 @@ dell'interfaccia (editor, rubrica, cifra/decifra) non usa mai termini come
 "chiave asimmetrica" o "fingerprint esadecimale". Chi vuole verificare i
 dettagli tecnici li trova tutti in un unico posto, dietro l'icona ⚙:
 
-- fingerprint completo (esadecimale) della propria identita e di ogni
+- fingerprint completo (esadecimale) della propria identità e di ogni
   contatto in rubrica;
 - algoritmo, data di creazione ed eventuale scadenza di ogni chiave
   (`sigillo-core/src/keyinfo.rs`);
 - export della chiave privata come file OpenPGP classico, protetto da
   password (l'alternativa "meno consigliata" alla seed phrase: un file
-  digitale e una superficie di attacco in piu rispetto a una frase scritta
+  digitale è una superficie di attacco in più rispetto a una frase scritta
   su carta);
-- rimozione dell'identita da questo computer (vedi sopra).
+- rimozione dell'identità da questo computer (vedi sopra).
 
 ## Scelte tecniche rilevanti
 
@@ -195,7 +209,9 @@ Per creare un pacchetto installabile per il tuo sistema operativo (`.app`/
 npm run tauri build
 ```
 
-I pacchetti finiti si trovano in `src-tauri/target/release/bundle/`.
+Essendo un workspace Cargo, i pacchetti finiti si trovano nella `target/`
+alla radice del progetto, non dentro `src-tauri/`:
+`target/release/bundle/`.
 
 ## Testare solo il core crittografico (senza aprire l'app)
 
@@ -217,28 +233,28 @@ I test coprono, tra l'altro:
 - che un file corrotto o non-OpenPGP dia un errore comprensibile;
 - che non sia possibile importare per sbaglio una chiave privata come se
   fosse quella pubblica di un contatto;
-- che il file dell'identita salvata su disco non contenga mai, in nessun
+- che il file dell'identità salvata su disco non contenga mai, in nessun
   punto, la seed phrase in chiaro;
 - che una passphrase locale sbagliata venga rifiutata, e che dopo
-  "rimuovi identita" il file sparisca davvero;
+  "rimuovi identità" il file sparisca davvero;
 - che il file esportato dalla sezione avanzate (chiave privata classica)
-  sia protetto da password e non utilizzabile senza.
+  sia protetto da password e non utilizzabile senza;
+- che la rubrica sopravviva a un riavvio (salvataggio e ricaricamento) e
+  che i contatti si accumulino invece di sovrascriversi l'uno con l'altro.
 
 ## Stato del progetto / cosa manca ancora
 
-Questo è l'MVP richiesto dal brief: identità persistita e cifrata sul
-dispositivo, cifratura, decifratura, import di un contatto, sezione
-avanzate separata dal resto dell'interfaccia, e una UI minimale che copre
-l'intero flusso (genera identità → mostra e conferma la seed phrase →
-imposta una passphrase locale → scrivi → cifra → salva come `.asc`; più
-decifratura, rubrica di base, e sblocco ai riavvii successivi).
-Consapevolmente **non** ancora implementati:
+Questo è l'MVP richiesto dal brief: identità e rubrica persistite e
+cifrate/salvate sul dispositivo, cifratura, decifratura, import di un
+contatto, sezione avanzate separata dal resto dell'interfaccia, e una UI
+minimale che copre l'intero flusso (genera identità → mostra e conferma
+la seed phrase → imposta una passphrase locale → scrivi → cifra → salva
+come `.asc`; più decifratura, rubrica persistente, e sblocco ai riavvii
+successivi). Consapevolmente **non** ancora implementati:
 
-- persistenza cifrata su disco della rubrica (oggi i contatti vivono solo
-  in memoria per la durata della sessione — la struttura in
-  `sigillo-core/src/contacts.rs` è pronta per essere collegata a uno
-  storage cifrato a riposo, con lo stesso meccanismo di `storage.rs`);
 - import di un contatto via QR code (oggi solo incollando testo/`.asc`);
+- rimozione di un singolo contatto dalla rubrica (oggi si può solo
+  svuotarla del tutto rimuovendo l'identità dal dispositivo);
 - indicatore di robustezza reale (entropia stimata) della passphrase
   locale — oggi si applica solo un requisito minimo di 8 caratteri;
 - pacchettizzazione mobile.

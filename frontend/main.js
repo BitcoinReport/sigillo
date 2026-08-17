@@ -55,13 +55,30 @@ function setError(id, message) {
   }
 }
 
-function renderIdentity(view) {
+async function renderIdentity(view) {
   currentIdentity = view;
   document.getElementById("my-name").textContent = view.display_name;
   document.getElementById("my-fingerprint-words").textContent =
     view.fingerprint_words.join("  ");
   document.getElementById("my-public-key").value = view.public_key_armored;
   document.getElementById("btn-open-advanced").hidden = false;
+
+  // La rubrica e salvata sul dispositivo: la ricarichiamo ad ogni sblocco,
+  // cosi i contatti aggiunti in sessioni precedenti sono ancora li.
+  contacts.length = 0;
+  try {
+    const saved = await invoke("load_contacts");
+    for (const c of saved) {
+      contacts.push({
+        name: c.name,
+        key: c.key,
+        fingerprintHex: c.fingerprint_hex,
+        fingerprintWords: c.fingerprint_words,
+      });
+    }
+  } catch (err) {
+    setError("contact-error", String(err));
+  }
   renderContactList();
 }
 
@@ -189,7 +206,7 @@ document.getElementById("btn-unlock").addEventListener("click", async (e) => {
     const view = await withLoading(e.currentTarget, () =>
       invoke("unlock_identity", { passphrase })
     );
-    renderIdentity(view);
+    await renderIdentity(view);
     setView("screen-main");
   } catch (err) {
     setError("unlock-error", String(err));
@@ -225,7 +242,7 @@ document.getElementById("btn-generate").addEventListener("click", async (e) => {
     const view = await withLoading(e.currentTarget, () =>
       invoke("generate_identity", { wordCount, displayName })
     );
-    renderIdentity(view);
+    await renderIdentity(view);
     pendingSeedWords = view.seed_words;
     renderSeedGrid(pendingSeedWords);
     setView("screen-seed");
@@ -244,7 +261,7 @@ document.getElementById("btn-import").addEventListener("click", async (e) => {
     const view = await withLoading(e.currentTarget, () =>
       invoke("import_identity", { phrase, displayName })
     );
-    renderIdentity(view);
+    await renderIdentity(view);
     // Chi reinserisce una seed phrase la conosce gia: non c'e bisogno di
     // rimostrarla/confermarla, si passa direttamente a proteggere questo
     // dispositivo con una passphrase locale.
@@ -335,21 +352,21 @@ document.getElementById("btn-add-contact").addEventListener("click", async (e) =
     return;
   }
   try {
-    const fp = await withLoading(e.currentTarget, () =>
-      invoke("contact_fingerprint_words", { armoredPublicKey: key })
+    const view = await withLoading(e.currentTarget, () =>
+      invoke("add_contact", { name, armoredPublicKey: key })
     );
     contacts.push({
-      name,
-      key,
-      fingerprintHex: fp.fingerprint_hex,
-      fingerprintWords: fp.fingerprint_words,
+      name: view.name,
+      key: view.key,
+      fingerprintHex: view.fingerprint_hex,
+      fingerprintWords: view.fingerprint_words,
     });
     renderContactList();
 
     const hintPanel = document.getElementById("contact-added-hint");
     hintPanel.querySelector("p:first-child").textContent =
       `${name} aggiunto/a. Per essere sicuro che sia davvero ${name} (e non qualcuno che finge di esserlo), leggi a voce queste parole a ${name} e verifica che corrispondano a quelle che vede anche ${name}:`;
-    hintPanel.querySelector(".fingerprint-words").textContent = fp.fingerprint_words.join("  ");
+    hintPanel.querySelector(".fingerprint-words").textContent = view.fingerprint_words.join("  ");
     hintPanel.hidden = false;
 
     document.getElementById("contact-name").value = "";

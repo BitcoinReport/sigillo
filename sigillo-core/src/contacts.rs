@@ -2,8 +2,12 @@
 //! del fingerprint (invece dell'esadecimale, una sequenza di parole
 //! della wordlist inglese BIP39, da confrontare a voce con il contatto).
 
+use std::fs;
+use std::path::Path;
+
 use anyhow::{Context, Result};
 use bip39::Language;
+use serde::{Deserialize, Serialize};
 
 use sequoia_openpgp as openpgp;
 use openpgp::parse::Parse;
@@ -57,6 +61,45 @@ pub fn fingerprint_to_words(fingerprint: &openpgp::Fingerprint) -> Vec<&'static 
     words
 }
 
+/// Un contatto salvato in rubrica, cosi come persiste su disco.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SavedContact {
+    pub name: String,
+    pub public_key_armored: String,
+}
+
+/// Carica la rubrica salvata su disco. Se non e mai stato salvato nulla
+/// (nessun file ancora), restituisce una rubrica vuota invece di un
+/// errore: e lo stato normale al primo avvio.
+pub fn load_address_book(path: &Path) -> Result<Vec<SavedContact>> {
+    if !path.is_file() {
+        return Ok(Vec::new());
+    }
+    let data = fs::read_to_string(path).context("impossibile leggere la rubrica salvata")?;
+    serde_json::from_str(&data).context("il file della rubrica e danneggiato")
+}
+
+/// Salva l'intera rubrica su disco, sovrascrivendo il file precedente.
+///
+/// A differenza della chiave privata dell'utente (`storage.rs`), le
+/// chiavi pubbliche dei contatti non sono materiale segreto: non serve
+/// cifrarle, ma vanno comunque scritte in modo da sopravvivere ai
+/// riavvii dell'app.
+pub fn save_address_book(path: &Path, contacts: &[SavedContact]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).context("impossibile creare la cartella dati dell'app")?;
+    }
+    let data = serde_json::to_string_pretty(contacts)
+        .context("errore interno nella serializzazione della rubrica")?;
+
+    // File temporaneo + rename atomico, come per il vault dell'identita:
+    // un crash a meta scrittura non deve lasciare una rubrica troncata.
+    let tmp_path = path.with_extension("tmp");
+    fs::write(&tmp_path, data).context("impossibile scrivere la rubrica")?;
+    fs::rename(&tmp_path, path).context("impossibile salvare la rubrica")?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -92,5 +135,63 @@ mod tests {
         assert_eq!(words_a, words_b);
         // Fingerprint v4 = 20 byte = 160 bit => 15 parole da 11 bit (con padding finale).
         assert_eq!(words_a.len(), 15);
+    }
+
+    #[test]
+    fn address_book_is_empty_when_no_file_exists_yet() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("contacts.json");
+        let book = load_address_book(&path).unwrap();
+        assert!(book.is_empty());
+    }
+
+    #[test]
+    fn address_book_save_then_load_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("contacts.json");
+
+        let contacts = vec![SavedContact {
+            name: "Giulia".to_string(),
+            public_key_armored: "-----BEGIN PGP PUBLIC KEY BLOCK-----\nfake\n-----END PGP PUBLIC KEY BLOCK-----".to_string(),
+        }];
+        save_address_book(&path, &contacts).unwrap();
+
+        let loaded = load_address_book(&path).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].name, "Giulia");
+        assert_eq!(loaded[0].public_key_armored, contacts[0].public_key_armored);
+    }
+
+    #[test]
+    fn address_book_accumulates_contacts_across_saves() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("contacts.json");
+
+        let mut book = load_address_book(&path).unwrap();
+        book.push(SavedContact {
+            name: "Giulia".to_string(),
+            public_key_armored: "chiave-di-giulia".to_string(),
+        });
+        save_address_book(&path, &book).unwrap();
+
+        let mut book = load_address_book(&path).unwrap();
+        book.push(SavedContact {
+            name: "Marco".to_string(),
+            public_key_armored: "chiave-di-marco".to_string(),
+        });
+        save_address_book(&path, &book).unwrap();
+
+        let final_book = load_address_book(&path).unwrap();
+        assert_eq!(final_book.len(), 2);
+        assert_eq!(final_book[0].name, "Giulia");
+        assert_eq!(final_book[1].name, "Marco");
+    }
+
+    #[test]
+    fn corrupted_address_book_file_is_reported_cleanly() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("contacts.json");
+        fs::write(&path, b"non sono json valido").unwrap();
+        assert!(load_address_book(&path).is_err());
     }
 }

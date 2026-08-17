@@ -7,6 +7,7 @@ use tauri::{AppHandle, Manager, State};
 use sigillo_core::{contacts, identity, keyinfo, message, storage};
 
 const VAULT_FILE_NAME: &str = "identity.sigillo";
+const CONTACTS_FILE_NAME: &str = "contacts.json";
 const MIN_PASSPHRASE_LEN: usize = 8;
 
 #[derive(Default)]
@@ -21,6 +22,14 @@ fn vault_path(app: &AppHandle) -> Result<PathBuf, String> {
         .app_data_dir()
         .map_err(|e| format!("impossibile trovare la cartella dati dell'app: {e}"))?;
     Ok(dir.join(VAULT_FILE_NAME))
+}
+
+fn contacts_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("impossibile trovare la cartella dati dell'app: {e}"))?;
+    Ok(dir.join(CONTACTS_FILE_NAME))
 }
 
 #[derive(Serialize)]
@@ -173,35 +182,79 @@ fn unlock_identity(
     Ok(view)
 }
 
-/// Rimuove in modo sicuro l'identita salvata su questo dispositivo. Dopo
-/// questa chiamata il prossimo avvio torna a mostrare il wizard di
-/// generazione/import, come al primo avvio.
+/// Rimuove in modo sicuro l'identita salvata su questo dispositivo, e con
+/// essa la rubrica: dopo questa chiamata il prossimo avvio torna a
+/// mostrare il wizard di generazione/import, come al primo avvio, con una
+/// rubrica di nuovo vuota.
 #[tauri::command]
 fn remove_identity_from_disk(app: AppHandle, state: State<AppState>) -> Result<(), String> {
     let path = vault_path(&app)?;
     storage::remove_identity(&path).map_err(|e| e.to_string())?;
+    // La rubrica potrebbe non esistere ancora (nessun contatto mai
+    // aggiunto): non e un errore, e il caso normale.
+    let _ = std::fs::remove_file(contacts_path(&app)?);
     *state.identity.lock().unwrap() = None;
     *state.display_name.lock().unwrap() = None;
     Ok(())
 }
 
 #[derive(Serialize)]
-struct ContactFingerprint {
+struct ContactView {
+    name: String,
+    key: String,
     fingerprint_hex: String,
     fingerprint_words: Vec<String>,
 }
 
-#[tauri::command]
-fn contact_fingerprint_words(armored_public_key: String) -> Result<ContactFingerprint, String> {
+fn contact_view(name: String, armored_public_key: String) -> Result<ContactView, String> {
     let cert =
         contacts::import_public_key(armored_public_key.as_bytes()).map_err(|e| e.to_string())?;
-    Ok(ContactFingerprint {
+    Ok(ContactView {
+        name,
+        key: armored_public_key,
         fingerprint_hex: cert.fingerprint().to_spaced_hex(),
         fingerprint_words: contacts::fingerprint_to_words(&cert.fingerprint())
             .into_iter()
             .map(str::to_string)
             .collect(),
     })
+}
+
+/// Carica la rubrica salvata su questo dispositivo (vuota se non e mai
+/// stato aggiunto nessun contatto). Da chiamare quando l'identita viene
+/// sbloccata/creata, cosi la rubrica non riparte vuota ad ogni avvio.
+#[tauri::command]
+fn load_contacts(app: AppHandle) -> Result<Vec<ContactView>, String> {
+    let path = contacts_path(&app)?;
+    let saved = contacts::load_address_book(&path).map_err(|e| e.to_string())?;
+    saved
+        .into_iter()
+        .map(|c| contact_view(c.name, c.public_key_armored))
+        .collect()
+}
+
+/// Aggiunge un contatto alla rubrica e lo salva subito su disco (le
+/// chiavi pubbliche dei contatti non sono materiale segreto come la
+/// chiave privata dell'utente, ma vanno comunque persistite: senza
+/// questo la rubrica si svuoterebbe ad ogni riavvio).
+#[tauri::command]
+fn add_contact(
+    app: AppHandle,
+    name: String,
+    armored_public_key: String,
+) -> Result<ContactView, String> {
+    // Valida la chiave prima di scrivere qualunque cosa su disco.
+    let view = contact_view(name.clone(), armored_public_key.clone())?;
+
+    let path = contacts_path(&app)?;
+    let mut book = contacts::load_address_book(&path).map_err(|e| e.to_string())?;
+    book.push(contacts::SavedContact {
+        name,
+        public_key_armored: armored_public_key,
+    });
+    contacts::save_address_book(&path, &book).map_err(|e| e.to_string())?;
+
+    Ok(view)
 }
 
 #[derive(Serialize)]
@@ -333,7 +386,8 @@ pub fn run() {
             save_identity_to_disk,
             unlock_identity,
             remove_identity_from_disk,
-            contact_fingerprint_words,
+            load_contacts,
+            add_contact,
             my_technical_details,
             contact_technical_details,
             export_private_key_file,
