@@ -1,4 +1,4 @@
-use sigillo_core::{contacts, identity, message};
+use sigillo_core::{composite, contacts, identity, message};
 
 fn alice() -> identity::Identity {
     identity::generate(identity::SeedWordCount::TwentyFour, "Alice").unwrap()
@@ -219,6 +219,62 @@ fn text_encrypt_is_unaffected_by_image_support() {
     let ciphertext = message::encrypt(&alice.cert, &[bob.cert.clone()], "Ciao", false).unwrap();
     let decrypted = message::decrypt(&bob.cert, &[], &ciphertext).unwrap();
     assert_eq!(decrypted.plaintext, "Ciao");
+}
+
+#[test]
+fn combined_text_and_image_round_trip_unsigned() {
+    let alice = alice();
+    let bob = bob();
+    let image = fake_image_bytes();
+
+    let combined = composite::encode("ciao Bob, guarda qui!", Some("foto.jpg"), "image/jpeg", &image);
+    let ciphertext = message::encrypt_bytes(
+        &alice.cert,
+        &[bob.cert.clone()],
+        &combined,
+        None,
+        false,
+        true,
+    )
+    .unwrap();
+
+    let decrypted = message::decrypt_bytes(&bob.cert, &[], &ciphertext).unwrap();
+    assert_eq!(decrypted.signature, message::SignatureStatus::Unsigned);
+
+    let unpacked = composite::decode(&decrypted.data).unwrap();
+    assert_eq!(unpacked.text, "ciao Bob, guarda qui!");
+    assert_eq!(unpacked.image_filename.as_deref(), Some("foto.jpg"));
+    assert_eq!(unpacked.image_mime, "image/jpeg");
+    assert_eq!(unpacked.image_data, image);
+}
+
+#[test]
+fn combined_text_and_image_round_trip_signed_and_verified() {
+    let alice = alice();
+    let bob = bob();
+    let image = fake_image_bytes();
+
+    let combined = composite::encode("messaggio firmato con foto", Some("foto.png"), "image/png", &image);
+    let ciphertext = message::encrypt_bytes(
+        &alice.cert,
+        &[bob.cert.clone()],
+        &combined,
+        None,
+        true,
+        true,
+    )
+    .unwrap();
+
+    let alice_public = alice.cert.clone().strip_secret_key_material();
+    let decrypted = message::decrypt_bytes(&bob.cert, &[alice_public], &ciphertext).unwrap();
+    match decrypted.signature {
+        message::SignatureStatus::Verified(fp) => assert_eq!(fp, alice.cert.fingerprint()),
+        other => panic!("firma non verificata: {other:?}"),
+    }
+
+    let unpacked = composite::decode(&decrypted.data).unwrap();
+    assert_eq!(unpacked.text, "messaggio firmato con foto");
+    assert_eq!(unpacked.image_data, image);
 }
 
 #[test]

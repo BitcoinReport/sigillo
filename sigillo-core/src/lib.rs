@@ -1,3 +1,4 @@
+pub mod composite;
 pub mod contacts;
 pub mod identity;
 pub mod keyinfo;

@@ -414,6 +414,56 @@ fn encrypt_image(
     Ok(())
 }
 
+/// Cifra insieme, in un unico file, un testo e un'immagine: il
+/// destinatario aprendo e decifrando quel singolo file ritrova entrambi,
+/// come un messaggio con didascalia e foto. I due contenuti vengono
+/// prima impacchettati con [`sigillo_core::composite::encode`] in
+/// un'unica sequenza di byte, poi cifrati normalmente: il motore
+/// crittografico non deve sapere che dentro ci sono due cose diverse.
+#[tauri::command]
+fn encrypt_combined(
+    app: AppHandle,
+    state: State<AppState>,
+    recipients_armored: Vec<String>,
+    plaintext: String,
+    source_path: String,
+    output_path: String,
+    sign: bool,
+) -> Result<(), String> {
+    let guard = state.identity.lock().unwrap();
+    let id = guard
+        .as_ref()
+        .ok_or("genera o importa prima la tua identità")?;
+    let recipients = recipients_from_armored(&recipients_armored)?;
+
+    let image_data = std::fs::read(&source_path)
+        .map_err(|e| format!("impossibile leggere il file immagine: {e}"))?;
+    let image_filename = std::path::Path::new(&source_path)
+        .file_name()
+        .map(|f| f.to_string_lossy().into_owned());
+    let image_mime =
+        detect_image_mime(&image_data).ok_or("formato immagine non riconosciuto")?;
+
+    let format =
+        settings::load_image_format(&settings_path(&app)?).map_err(|e| e.to_string())?;
+    let armor = format == settings::ImageFormat::Asc;
+
+    let combined = sigillo_core::composite::encode(
+        &plaintext,
+        image_filename.as_deref(),
+        image_mime,
+        &image_data,
+    );
+
+    let ciphertext = message::encrypt_bytes(&id.cert, &recipients, &combined, None, sign, armor)
+        .map_err(|e| e.to_string())?;
+
+    std::fs::write(&output_path, &ciphertext)
+        .map_err(|e| format!("impossibile salvare il file cifrato: {e}"))?;
+
+    Ok(())
+}
+
 /// Riconosce se `data` è un'immagine nei formati comuni guardando i
 /// primi byte (che non cambiano cifrando/decifrando), non l'estensione
 /// del file: funziona anche se il mittente ha usato un altro programma
@@ -461,6 +511,28 @@ fn build_decrypt_view(
         }
         message::SignatureStatus::Unverifiable => ("non_verificabile".to_string(), None),
     };
+
+    // Va controllato prima degli altri due casi: un pacchetto combinato
+    // non ha i byte magici di un'immagine pura, ma per puro caso i suoi
+    // byte potrebbero comunque risultare UTF-8 valido, finendo scambiati
+    // per testo semplice se non lo si riconosce per primo.
+    if sigillo_core::composite::is_combined(&data) {
+        if let Ok(combined) = sigillo_core::composite::decode(&data) {
+            return DecryptView {
+                kind: "combinato".to_string(),
+                plaintext: Some(combined.text),
+                image_data_base64: Some(
+                    base64::engine::general_purpose::STANDARD.encode(&combined.image_data),
+                ),
+                image_mime: Some(combined.image_mime),
+                filename: combined.image_filename,
+                signature_status,
+                signer_fingerprint,
+            };
+        }
+        // Pacchetto marcato come combinato ma illeggibile: ripiega sul
+        // trattarlo come gli altri casi, invece di far fallire tutto.
+    }
 
     if let Some(mime) = detect_image_mime(&data) {
         return DecryptView {
@@ -574,6 +646,7 @@ pub fn run() {
             set_image_format,
             encrypt_message,
             encrypt_image,
+            encrypt_combined,
             decrypt_message,
             decrypt_file,
         ])

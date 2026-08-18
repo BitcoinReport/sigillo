@@ -535,7 +535,32 @@ document.getElementById("btn-encrypt").addEventListener("click", async (e) => {
       let textDone = false;
       let imageDone = false;
 
-      if (plaintext) {
+      if (plaintext && attachedImagePath) {
+        // Testo e immagine insieme: un unico file cifrato, cosi' chi lo
+        // riceve li ritrova entrambi aprendolo una sola volta (come un
+        // messaggio con didascalia e foto), invece di due file separati.
+        const sourceName = attachedImagePath.split(/[\\/]/).pop();
+        const ext = currentImageFormat === "gpg" ? "gpg" : "asc";
+        const outputPath = await save({
+          defaultPath: `${sourceName}.${ext}`,
+          filters: [{ name: "Messaggio cifrato", extensions: [ext] }],
+        });
+        if (outputPath) {
+          await invoke("encrypt_combined", {
+            recipientsArmored: selected,
+            plaintext,
+            sourcePath: attachedImagePath,
+            outputPath,
+            sign,
+          });
+          document.getElementById("encrypt-image-result-label").textContent =
+            "Messaggio cifrato salvato:";
+          document.getElementById("encrypt-image-saved-path").textContent = outputPath;
+          document.getElementById("encrypt-image-result").hidden = false;
+          textDone = true;
+          imageDone = true;
+        }
+      } else if (plaintext) {
         const ciphertext = await invoke("encrypt_message", {
           recipientsArmored: selected,
           plaintext,
@@ -544,9 +569,7 @@ document.getElementById("btn-encrypt").addEventListener("click", async (e) => {
         document.getElementById("ciphertext-out").value = ciphertext;
         document.getElementById("encrypt-result").hidden = false;
         textDone = true;
-      }
-
-      if (attachedImagePath) {
+      } else if (attachedImagePath) {
         const sourceName = attachedImagePath.split(/[\\/]/).pop();
         const ext = currentImageFormat === "gpg" ? "gpg" : "asc";
         const outputPath = await save({
@@ -560,6 +583,8 @@ document.getElementById("btn-encrypt").addEventListener("click", async (e) => {
             outputPath,
             sign,
           });
+          document.getElementById("encrypt-image-result-label").textContent =
+            "Immagine cifrata salvata:";
           document.getElementById("encrypt-image-saved-path").textContent = outputPath;
           document.getElementById("encrypt-image-result").hidden = false;
           imageDone = true;
@@ -639,7 +664,12 @@ function renderDecryptResult(result) {
   if (result.kind === "testo") {
     document.getElementById("plaintext-out").value = result.plaintext;
     textBlock.hidden = false;
-  } else if (result.kind === "immagine") {
+  } else if (result.kind === "immagine" || result.kind === "combinato") {
+    if (result.kind === "combinato") {
+      document.getElementById("plaintext-out").value = result.plaintext;
+      textBlock.hidden = false;
+    }
+
     const bytes = base64ToBytes(result.image_data_base64);
     lastDecrypted = { bytes, filename: result.filename };
 
