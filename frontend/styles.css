@@ -412,11 +412,21 @@ details summary {
   margin: 0 0 0.6rem;
 }
 
+/*
+ * Come per .screen (vedi commento piu' sopra): un selettore per ID ha
+ * specificita' maggiore di [hidden] dello user-agent, quindi senza questa
+ * regola esplicita impostare .hidden=true su questo elemento non lo
+ * nasconderebbe visivamente.
+ */
 #image-preview-wrap {
   display: flex;
   flex-direction: column;
   align-items: center;
   gap: 0.5rem;
+}
+
+#image-preview-wrap[hidden] {
+  display: none;
 }
 
 #image-preview,
@@ -434,6 +444,10 @@ details summary {
   align-items: center;
   gap: 0.5rem;
   margin-top: 0.75rem;
+}
+
+#decrypt-result-image[hidden] {
+  display: none;
 }
 
 .contact-list {

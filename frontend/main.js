@@ -64,13 +64,17 @@ document.querySelectorAll(".link-back").forEach((btn) => {
  * di sembrare "morta" per uno o due secondi.
  */
 async function withLoading(button, action) {
-  button.disabled = true;
-  button.classList.add("is-loading");
+  if (button) {
+    button.disabled = true;
+    button.classList.add("is-loading");
+  }
   try {
     return await action();
   } finally {
-    button.disabled = false;
-    button.classList.remove("is-loading");
+    if (button) {
+      button.disabled = false;
+      button.classList.remove("is-loading");
+    }
   }
 }
 
@@ -528,6 +532,9 @@ document.getElementById("btn-encrypt").addEventListener("click", async (e) => {
 
   try {
     await withLoading(e.currentTarget, async () => {
+      let textDone = false;
+      let imageDone = false;
+
       if (plaintext) {
         const ciphertext = await invoke("encrypt_message", {
           recipientsArmored: selected,
@@ -536,6 +543,7 @@ document.getElementById("btn-encrypt").addEventListener("click", async (e) => {
         });
         document.getElementById("ciphertext-out").value = ciphertext;
         document.getElementById("encrypt-result").hidden = false;
+        textDone = true;
       }
 
       if (attachedImagePath) {
@@ -554,7 +562,30 @@ document.getElementById("btn-encrypt").addEventListener("click", async (e) => {
           });
           document.getElementById("encrypt-image-saved-path").textContent = outputPath;
           document.getElementById("encrypt-image-result").hidden = false;
+          imageDone = true;
         }
+      }
+
+      // Il risultato appena prodotto resta visibile (per copiarlo o
+      // ritrovare il percorso del file salvato): a svuotarsi sono solo i
+      // campi di composizione, cosi' la scheda e' subito pronta per un
+      // nuovo messaggio senza lasciare testo o immagini della volta
+      // precedente. Se l'utente ha annullato il salvataggio
+      // dell'immagine (outputPath non scelto), l'allegato resta: quella
+      // parte non e' stata completata.
+      if (textDone) {
+        document.getElementById("message-text").value = "";
+      }
+      if (imageDone) {
+        clearAttachedImage();
+      }
+      if (textDone || imageDone) {
+        for (const checkbox of document.querySelectorAll(
+          '#recipient-list input[type="checkbox"]:checked'
+        )) {
+          checkbox.checked = false;
+        }
+        document.getElementById("sign-message").checked = false;
       }
     });
   } catch (err) {
@@ -633,6 +664,10 @@ function renderDecryptResult(result) {
 }
 
 document.getElementById("btn-load-file").addEventListener("click", async (e) => {
+  // Va catturato subito: dopo il primo "await" l'evento ha gia' finito
+  // il suo dispatch e "currentTarget" torna null (comportamento standard
+  // del DOM, non un bug del webview).
+  const button = e.currentTarget;
   setError("decrypt-error", null);
   const path = await open({
     multiple: false,
@@ -641,7 +676,7 @@ document.getElementById("btn-load-file").addEventListener("click", async (e) => 
   if (!path) return;
 
   try {
-    const result = await withLoading(e.currentTarget, () =>
+    const result = await withLoading(button, () =>
       invoke("decrypt_file", { contactsArmored: contacts.map((c) => c.key), path })
     );
     renderDecryptResult(result);
