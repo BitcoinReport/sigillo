@@ -240,19 +240,43 @@ struct ContactView {
     key: String,
     fingerprint_hex: String,
     fingerprint_words: Vec<String>,
+    photo_base64: Option<String>,
+    photo_mime: Option<String>,
+    email: Option<String>,
+    phone: Option<String>,
+    notes: Option<String>,
 }
 
-fn contact_view(name: String, armored_public_key: String) -> Result<ContactView, String> {
-    let cert =
-        contacts::import_public_key(armored_public_key.as_bytes()).map_err(|e| e.to_string())?;
+fn contact_view(saved: &contacts::SavedContact) -> Result<ContactView, String> {
+    let cert = contacts::import_public_key(saved.public_key_armored.as_bytes())
+        .map_err(|e| e.to_string())?;
     Ok(ContactView {
-        name,
-        key: armored_public_key,
+        name: saved.name.clone(),
+        key: saved.public_key_armored.clone(),
         fingerprint_hex: cert.fingerprint().to_spaced_hex(),
         fingerprint_words: contacts::fingerprint_to_words(&cert.fingerprint())
             .into_iter()
             .map(str::to_string)
             .collect(),
+        photo_base64: saved.photo_base64.clone(),
+        photo_mime: saved.photo_mime.clone(),
+        email: saved.email.clone(),
+        phone: saved.phone.clone(),
+        notes: saved.notes.clone(),
+    })
+}
+
+/// Trasforma una stringa facoltativa arrivata dal modulo in `None` se
+/// vuota (o solo spazi): il frontend invia sempre una stringa per i
+/// campi facoltativi non compilati, invece di ometterli.
+fn normalize_optional(value: Option<String>) -> Option<String> {
+    value.and_then(|v| {
+        let trimmed = v.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
     })
 }
 
@@ -263,16 +287,15 @@ fn contact_view(name: String, armored_public_key: String) -> Result<ContactView,
 fn load_contacts(app: AppHandle) -> Result<Vec<ContactView>, String> {
     let path = contacts_path(&app)?;
     let saved = contacts::load_address_book(&path).map_err(|e| e.to_string())?;
-    saved
-        .into_iter()
-        .map(|c| contact_view(c.name, c.public_key_armored))
-        .collect()
+    saved.iter().map(contact_view).collect()
 }
 
 /// Aggiunge un contatto alla rubrica e lo salva subito su disco (le
 /// chiavi pubbliche dei contatti non sono materiale segreto come la
 /// chiave privata dell'utente, ma vanno comunque persistite: senza
-/// questo la rubrica si svuoterebbe ad ogni riavvio).
+/// questo la rubrica si svuoterebbe ad ogni riavvio). Foto, email,
+/// telefono e note si aggiungono in un secondo momento dalla scheda
+/// dettaglio del contatto (vedi `update_contact`).
 #[tauri::command]
 fn add_contact(
     app: AppHandle,
@@ -280,17 +303,53 @@ fn add_contact(
     armored_public_key: String,
 ) -> Result<ContactView, String> {
     // Valida la chiave prima di scrivere qualunque cosa su disco.
-    let view = contact_view(name.clone(), armored_public_key.clone())?;
+    contacts::import_public_key(armored_public_key.as_bytes()).map_err(|e| e.to_string())?;
 
     let path = contacts_path(&app)?;
     let mut book = contacts::load_address_book(&path).map_err(|e| e.to_string())?;
-    book.push(contacts::SavedContact {
+    let entry = contacts::SavedContact {
         name,
         public_key_armored: armored_public_key,
-    });
+        ..Default::default()
+    };
+    book.push(entry.clone());
     contacts::save_address_book(&path, &book).map_err(|e| e.to_string())?;
 
-    Ok(view)
+    contact_view(&entry)
+}
+
+/// Aggiorna nome, foto e dettagli facoltativi (email, telefono, note)
+/// di un contatto già in rubrica, individuato dalla sua chiave pubblica
+/// (unica e immutabile, a differenza del nome che qui si può cambiare).
+#[tauri::command]
+fn update_contact(
+    app: AppHandle,
+    public_key_armored: String,
+    name: String,
+    email: Option<String>,
+    phone: Option<String>,
+    notes: Option<String>,
+    photo_base64: Option<String>,
+    photo_mime: Option<String>,
+) -> Result<ContactView, String> {
+    let path = contacts_path(&app)?;
+    let mut book = contacts::load_address_book(&path).map_err(|e| e.to_string())?;
+    let entry = book
+        .iter_mut()
+        .find(|c| c.public_key_armored == public_key_armored)
+        .ok_or("contatto non trovato in rubrica")?;
+
+    entry.name = name;
+    entry.email = normalize_optional(email);
+    entry.phone = normalize_optional(phone);
+    entry.notes = normalize_optional(notes);
+    entry.photo_base64 = photo_base64;
+    entry.photo_mime = photo_mime;
+    let updated = entry.clone();
+
+    contacts::save_address_book(&path, &book).map_err(|e| e.to_string())?;
+
+    contact_view(&updated)
 }
 
 #[derive(Serialize)]
@@ -639,6 +698,7 @@ pub fn run() {
             remove_identity_from_disk,
             load_contacts,
             add_contact,
+            update_contact,
             my_technical_details,
             contact_technical_details,
             export_private_key_file,

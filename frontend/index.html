@@ -323,6 +323,55 @@
       </div>
     </section>
 
+    <!-- ============ SCHERMATA: dettaglio contatto ============ -->
+    <section id="screen-contact-detail" class="screen">
+      <div class="button-row advanced-top">
+        <button id="btn-close-contact-detail" class="secondary">← Torna alla rubrica</button>
+      </div>
+
+      <div class="card">
+        <h2>Dettagli contatto</h2>
+
+        <div class="contact-photo-row">
+          <div id="contact-detail-avatar" class="avatar avatar-lg">
+            <img id="contact-detail-photo" alt="" hidden />
+            <span id="contact-detail-initial"></span>
+          </div>
+          <div class="button-row">
+            <button id="btn-choose-contact-photo" class="secondary" type="button">Cambia foto...</button>
+            <button id="btn-remove-contact-photo" class="secondary" type="button">Rimuovi foto</button>
+          </div>
+        </div>
+
+        <label for="contact-detail-name">Nome</label>
+        <input id="contact-detail-name" type="text" />
+
+        <label>Impronta (fingerprint) completa — leggila a voce per verificarla</label>
+        <p id="contact-detail-fingerprint-words" class="fingerprint-words"></p>
+
+        <label for="contact-detail-key">Chiave pubblica</label>
+        <textarea id="contact-detail-key" rows="8" readonly></textarea>
+        <div class="button-row">
+          <button id="btn-copy-contact-key" class="secondary">Copia</button>
+        </div>
+
+        <label for="contact-detail-email">Email (facoltativa)</label>
+        <input id="contact-detail-email" type="text" placeholder="Es. giulia@esempio.it" />
+
+        <label for="contact-detail-phone">Telefono (facoltativo)</label>
+        <input id="contact-detail-phone" type="text" placeholder="Es. +39 333 1234567" />
+
+        <label for="contact-detail-notes">Note (facoltative)</label>
+        <textarea id="contact-detail-notes" rows="4" placeholder="Note personali su questo contatto..."></textarea>
+
+        <div class="button-row">
+          <button id="btn-save-contact-detail" class="primary">Salva modifiche</button>
+        </div>
+        <p id="contact-detail-error" class="error" hidden></p>
+        <p id="contact-detail-saved-hint" class="hint" hidden>Modifiche salvate.</p>
+      </div>
+    </section>
+
     <!-- ============ SCHERMATA: avanzate ============ -->
     <section id="screen-advanced" class="screen">
       <div class="button-row advanced-top">
@@ -409,6 +458,11 @@
         <p id="remove-error" class="error" hidden></p>
       </div>
     </section>
+
+    <div id="image-lightbox" class="lightbox" hidden>
+      <button id="btn-close-lightbox" class="lightbox-close" aria-label="Chiudi">✕</button>
+      <img id="lightbox-image" alt="Immagine ingrandita" />
+    </div>
 
     <script type="module" src="main.js"></script>
   </body>

@@ -4,11 +4,23 @@
   --fg: #1c1b1a;
   --card-bg: #ffffff;
   --border: #ddd8cf;
-  --accent: #2f5d50;
+  /* Palette "smeraldo": verde base per testo/icone d'accento, chiaro e
+     scuro come estremi del gradiente sui pulsanti primari, oro Bitcoin
+     solo come dettaglio (bordo sottile), mai come superficie ampia. */
+  --accent: #166b52;
+  --accent-light: #2fae87;
+  --accent-dark: #0d4d3c;
+  --accent-gold: #f7931a;
   --accent-fg: #ffffff;
   --error: #a33a2f;
+  /* Colore degli avvisi di sicurezza: volutamente ambra/arancione pieno
+     e distinto dall'oro (usato solo a bordo sottile), cosi' "azione da
+     compiere" (verde) e "avviso da leggere" (ambra) restano sempre
+     distinguibili a colpo d'occhio. */
   --warning-bg: #fff3cd;
   --warning-fg: #6b4d00;
+  --success-bg: #dcf3ea;
+  --success-fg: #0d4d3c;
   --muted: #6b6558;
   --danger: #a33a2f;
   --danger-fg: #ffffff;
@@ -21,10 +33,15 @@
     --fg: #f0efe9;
     --card-bg: #1f2224;
     --border: #33383b;
-    --accent: #6fbfa8;
+    --accent: #2fae87;
+    --accent-light: #45c79c;
+    --accent-dark: #166b52;
+    --accent-gold: #f7931a;
     --accent-fg: #0c1210;
     --warning-bg: #3a2f00;
     --warning-fg: #f5d97a;
+    --success-bg: rgba(47, 174, 135, 0.18);
+    --success-fg: #6fe3bd;
     --muted: #9a9587;
     --danger: #c0564a;
     --danger-fg: #1a0d0b;
@@ -92,6 +109,8 @@ body {
  */
 .screen {
   display: none;
+  flex-direction: column;
+  align-items: center;
   justify-content: center;
   padding: 1rem 1.5rem 3rem;
 }
@@ -168,8 +187,12 @@ button {
 }
 
 button.primary {
-  background: var(--accent);
+  background: linear-gradient(160deg, var(--accent-light), var(--accent-dark));
   color: var(--accent-fg);
+  border: 1px solid rgba(247, 147, 26, 0.55);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.22),
+    inset 0 -1px 3px rgba(0, 0, 0, 0.22);
 }
 
 button.secondary {
@@ -438,6 +461,47 @@ details summary {
   object-fit: contain;
 }
 
+#decrypt-image-preview {
+  cursor: zoom-in;
+}
+
+.lightbox {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.85);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+  cursor: zoom-out;
+}
+
+.lightbox[hidden] {
+  display: none;
+}
+
+.lightbox img {
+  max-width: 90vw;
+  max-height: 90vh;
+  object-fit: contain;
+  border-radius: 8px;
+  cursor: default;
+}
+
+.lightbox-close {
+  position: absolute;
+  top: 1rem;
+  right: 1rem;
+  background: rgba(255, 255, 255, 0.15);
+  color: #fff;
+  border: 1px solid rgba(255, 255, 255, 0.3);
+  border-radius: 999px;
+  width: 2.4rem;
+  height: 2.4rem;
+  font-size: 1.1rem;
+  cursor: pointer;
+}
+
 #decrypt-result-image {
   display: flex;
   flex-direction: column;
@@ -456,23 +520,75 @@ details summary {
 }
 
 .contact-list li {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  padding: 0.5rem 0;
   border-bottom: 1px solid var(--border);
 }
 
 .contact-list li.empty-state {
   display: block;
   border-bottom: none;
-  padding: 0.25rem 0;
+  padding: 0.5rem 0;
+  color: var(--muted);
 }
 
-.contact-list .fp {
-  color: var(--muted);
-  font-size: 0.8rem;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+.contact-row {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  width: 100%;
+  background: transparent;
+  border: none;
+  border-radius: 8px;
+  padding: 0.5rem 0.4rem;
+  text-align: left;
+  font-size: 0.95rem;
+  color: var(--fg);
+}
+
+.contact-row:hover:not(:disabled) {
+  background: var(--bg);
+  filter: none;
+}
+
+.contact-row-name {
+  font-weight: 500;
+}
+
+.avatar {
+  flex-shrink: 0;
+  border-radius: 50%;
+  background: var(--accent);
+  color: var(--accent-fg);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 600;
+  overflow: hidden;
+}
+
+.avatar img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.avatar-sm {
+  width: 2.25rem;
+  height: 2.25rem;
+  font-size: 0.9rem;
+}
+
+.avatar-lg {
+  width: 5rem;
+  height: 5rem;
+  font-size: 1.8rem;
+}
+
+.contact-photo-row {
+  display: flex;
+  align-items: center;
+  gap: 1.25rem;
+  margin: 1rem 0;
+  flex-wrap: wrap;
 }
 
 .fingerprint-words {
@@ -497,8 +613,8 @@ details summary {
 }
 
 .signature-status.verified {
-  background: #d9f0e3;
-  color: #1e5c3a;
+  background: var(--success-bg);
+  color: var(--success-fg);
 }
 
 .signature-status.unverifiable {

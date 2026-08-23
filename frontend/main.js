@@ -4,11 +4,34 @@ const { writeTextFile, writeFile, readFile } = window.__TAURI__.fs;
 const { writeText } = window.__TAURI__.clipboardManager;
 const { getCurrentWebview } = window.__TAURI__.webview;
 
-/** @type {{name: string, key: string, fingerprintHex: string, fingerprintWords: string[]}[]} */
+/** @type {{name: string, key: string, fingerprintHex: string, fingerprintWords: string[], email: string|null, phone: string|null, notes: string|null, photoBase64: string|null, photoMime: string|null}[]} */
 const contacts = [];
 let currentIdentity = null;
 let pendingSeedWords = [];
 let currentImageFormat = "asc";
+
+// Indice (in "contacts") del contatto attualmente aperto nella scheda
+// dettaglio, o null quando quella schermata non è la vista corrente.
+let contactDetailIndex = null;
+
+// Foto scelta per il contatto aperto nella scheda dettaglio, in attesa
+// di essere salvata: { base64, mime } oppure null se non impostata o
+// appena rimossa. Diventa persistente solo al click su "Salva modifiche".
+let contactDetailPendingPhoto = undefined; // undefined = "non toccata"
+
+function contactFromView(view) {
+  return {
+    name: view.name,
+    key: view.key,
+    fingerprintHex: view.fingerprint_hex,
+    fingerprintWords: view.fingerprint_words,
+    email: view.email || null,
+    phone: view.phone || null,
+    notes: view.notes || null,
+    photoBase64: view.photo_base64 || null,
+    photoMime: view.photo_mime || null,
+  };
+}
 
 // Immagine allegata nella scheda "Scrivi", in attesa di essere cifrata.
 let attachedImagePath = null;
@@ -36,6 +59,33 @@ function base64ToBytes(base64) {
   const bytes = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
   return bytes;
+}
+
+// Nessun motore di rendering dei webview usati da Sigillo (WebKitGTK su
+// Linux, WKWebView su macOS, WebView2 su Windows) sa mostrare in modo
+// affidabile un'immagine HEIC/HEIF tramite <img>: meglio riconoscerlo
+// subito e mostrare un messaggio chiaro, invece di tentare il
+// caricamento sperando che l'evento "error" scatti sempre allo stesso
+// modo su ogni piattaforma.
+const UNSUPPORTED_PREVIEW_MIMES = new Set(["image/heic", "image/heif"]);
+
+// Ridimensiona un'immagine (bytes grezzi) a un lato massimo di
+// `maxDim` pixel e la restituisce come coppia { base64, mime }, pronta
+// per essere salvata nella rubrica come foto profilo: evita di
+// appesantire inutilmente il file della rubrica con foto originali da
+// diversi MB per una miniatura tonda.
+async function resizeImageToDataUrl(bytes, mime, maxDim) {
+  const blob = new Blob([bytes], { type: mime });
+  const bitmap = await createImageBitmap(blob);
+  const scale = Math.min(1, maxDim / Math.max(bitmap.width, bitmap.height));
+  const w = Math.max(1, Math.round(bitmap.width * scale));
+  const h = Math.max(1, Math.round(bitmap.height * scale));
+  const canvas = document.createElement("canvas");
+  canvas.width = w;
+  canvas.height = h;
+  canvas.getContext("2d").drawImage(bitmap, 0, 0, w, h);
+  const dataUrl = canvas.toDataURL("image/jpeg", 0.85);
+  return { base64: dataUrl.split(",")[1], mime: "image/jpeg" };
 }
 
 // ---------- Stato applicativo: una sola vista visibile alla volta ----------
@@ -103,12 +153,7 @@ async function renderIdentity(view) {
   try {
     const saved = await invoke("load_contacts");
     for (const c of saved) {
-      contacts.push({
-        name: c.name,
-        key: c.key,
-        fingerprintHex: c.fingerprint_hex,
-        fingerprintWords: c.fingerprint_words,
-      });
+      contacts.push(contactFromView(c));
     }
   } catch (err) {
     setError("contact-error", String(err));
@@ -176,6 +221,20 @@ function renderRecipientList() {
   });
 }
 
+function buildAvatarElement(contact, sizeClass) {
+  const avatar = document.createElement("span");
+  avatar.className = `avatar ${sizeClass}`;
+  if (contact.photoBase64) {
+    const img = document.createElement("img");
+    img.src = `data:${contact.photoMime};base64,${contact.photoBase64}`;
+    img.alt = "";
+    avatar.appendChild(img);
+  } else {
+    avatar.textContent = (contact.name || "?").trim().charAt(0).toUpperCase() || "?";
+  }
+  return avatar;
+}
+
 function renderContactList() {
   const list = document.getElementById("contact-list");
   list.innerHTML = "";
@@ -185,15 +244,18 @@ function renderContactList() {
     renderRecipientList();
     return;
   }
-  contacts.forEach((contact) => {
+  contacts.forEach((contact, i) => {
     const li = document.createElement("li");
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = "contact-row";
+    row.appendChild(buildAvatarElement(contact, "avatar-sm"));
     const nameSpan = document.createElement("span");
+    nameSpan.className = "contact-row-name";
     nameSpan.textContent = contact.name;
-    const fpSpan = document.createElement("span");
-    fpSpan.className = "fp";
-    fpSpan.textContent = contact.fingerprintWords.slice(0, 4).join(" ") + "...";
-    li.appendChild(nameSpan);
-    li.appendChild(fpSpan);
+    row.appendChild(nameSpan);
+    row.addEventListener("click", () => openContactDetail(i));
+    li.appendChild(row);
     list.appendChild(li);
   });
   renderRecipientList();
@@ -203,6 +265,8 @@ function resetAppToFirstRunState() {
   currentIdentity = null;
   pendingSeedWords = [];
   contacts.length = 0;
+  contactDetailIndex = null;
+  contactDetailPendingPhoto = undefined;
   renderContactList();
   clearAttachedImage();
   lastDecrypted = null;
@@ -241,15 +305,21 @@ async function setAttachedImage(path) {
 
   const img = document.getElementById("image-preview");
   const unsupported = document.getElementById("image-preview-unsupported");
-  img.onload = () => {
-    img.hidden = false;
-    unsupported.hidden = true;
-  };
-  img.onerror = () => {
+  if (UNSUPPORTED_PREVIEW_MIMES.has(mime)) {
     img.hidden = true;
+    img.src = "";
     unsupported.hidden = false;
-  };
-  img.src = attachedImagePreviewUrl;
+  } else {
+    img.onload = () => {
+      img.hidden = false;
+      unsupported.hidden = true;
+    };
+    img.onerror = () => {
+      img.hidden = true;
+      unsupported.hidden = false;
+    };
+    img.src = attachedImagePreviewUrl;
+  }
   document.getElementById("image-preview-name").textContent = filename;
   document.getElementById("image-preview-wrap").hidden = false;
   document.getElementById("image-dropzone-prompt").hidden = true;
@@ -478,12 +548,7 @@ document.getElementById("btn-add-contact").addEventListener("click", async (e) =
     const view = await withLoading(e.currentTarget, () =>
       invoke("add_contact", { name, armoredPublicKey: key })
     );
-    contacts.push({
-      name: view.name,
-      key: view.key,
-      fingerprintHex: view.fingerprint_hex,
-      fingerprintWords: view.fingerprint_words,
-    });
+    contacts.push(contactFromView(view));
     renderContactList();
 
     const hintPanel = document.getElementById("contact-added-hint");
@@ -496,6 +561,129 @@ document.getElementById("btn-add-contact").addEventListener("click", async (e) =
     document.getElementById("contact-key").value = "";
   } catch (err) {
     setError("contact-error", String(err));
+  }
+});
+
+// ---------- Dettaglio contatto ----------
+
+function renderContactDetailAvatar(contact) {
+  const img = document.getElementById("contact-detail-photo");
+  const initial = document.getElementById("contact-detail-initial");
+  const base64 =
+    contactDetailPendingPhoto !== undefined ? contactDetailPendingPhoto?.base64 : contact.photoBase64;
+  const mime =
+    contactDetailPendingPhoto !== undefined ? contactDetailPendingPhoto?.mime : contact.photoMime;
+
+  if (base64) {
+    img.src = `data:${mime};base64,${base64}`;
+    img.hidden = false;
+    initial.hidden = true;
+  } else {
+    img.hidden = true;
+    img.src = "";
+    initial.hidden = false;
+    initial.textContent = (contact.name || "?").trim().charAt(0).toUpperCase() || "?";
+  }
+}
+
+function openContactDetail(index) {
+  const contact = contacts[index];
+  if (!contact) return;
+  contactDetailIndex = index;
+  contactDetailPendingPhoto = undefined;
+  setError("contact-detail-error", null);
+  document.getElementById("contact-detail-saved-hint").hidden = true;
+
+  document.getElementById("contact-detail-name").value = contact.name;
+  document.getElementById("contact-detail-fingerprint-words").textContent =
+    contact.fingerprintWords.join("  ");
+  document.getElementById("contact-detail-key").value = contact.key;
+  document.getElementById("contact-detail-email").value = contact.email || "";
+  document.getElementById("contact-detail-phone").value = contact.phone || "";
+  document.getElementById("contact-detail-notes").value = contact.notes || "";
+  renderContactDetailAvatar(contact);
+
+  setView("screen-contact-detail");
+}
+
+document.getElementById("btn-close-contact-detail").addEventListener("click", () => {
+  contactDetailIndex = null;
+  contactDetailPendingPhoto = undefined;
+  setView("screen-main");
+});
+
+document.getElementById("btn-copy-contact-key").addEventListener("click", async () => {
+  await writeText(document.getElementById("contact-detail-key").value);
+});
+
+document.getElementById("btn-choose-contact-photo").addEventListener("click", async () => {
+  setError("contact-detail-error", null);
+  const path = await open({
+    multiple: false,
+    filters: [{ name: "Immagini", extensions: ["jpg", "jpeg", "png"] }],
+  });
+  if (!path) return;
+  try {
+    const filename = path.split(/[\\/]/).pop();
+    const mime = guessImageMime(filename);
+    if (!mime || UNSUPPORTED_PREVIEW_MIMES.has(mime)) {
+      setError(
+        "contact-detail-error",
+        "Formato non supportato per la foto profilo: usa un'immagine JPG o PNG."
+      );
+      return;
+    }
+    const bytes = await readFile(path);
+    contactDetailPendingPhoto = await resizeImageToDataUrl(bytes, mime, 320);
+    renderContactDetailAvatar(contacts[contactDetailIndex]);
+  } catch (err) {
+    setError("contact-detail-error", String(err));
+  }
+});
+
+document.getElementById("btn-remove-contact-photo").addEventListener("click", () => {
+  contactDetailPendingPhoto = null;
+  renderContactDetailAvatar(contacts[contactDetailIndex]);
+});
+
+document.getElementById("btn-save-contact-detail").addEventListener("click", async (e) => {
+  setError("contact-detail-error", null);
+  document.getElementById("contact-detail-saved-hint").hidden = true;
+  const contact = contacts[contactDetailIndex];
+  if (!contact) return;
+
+  const name = document.getElementById("contact-detail-name").value.trim();
+  if (!name) {
+    setError("contact-detail-error", "Il nome non può essere vuoto.");
+    return;
+  }
+  const email = document.getElementById("contact-detail-email").value;
+  const phone = document.getElementById("contact-detail-phone").value;
+  const notes = document.getElementById("contact-detail-notes").value;
+
+  const photo =
+    contactDetailPendingPhoto !== undefined
+      ? contactDetailPendingPhoto
+      : { base64: contact.photoBase64, mime: contact.photoMime };
+
+  try {
+    const view = await withLoading(e.currentTarget, () =>
+      invoke("update_contact", {
+        publicKeyArmored: contact.key,
+        name,
+        email,
+        phone,
+        notes,
+        photoBase64: photo?.base64 || null,
+        photoMime: photo?.mime || null,
+      })
+    );
+    contacts[contactDetailIndex] = contactFromView(view);
+    contactDetailPendingPhoto = undefined;
+    renderContactList();
+    document.getElementById("contact-detail-saved-hint").hidden = false;
+  } catch (err) {
+    setError("contact-detail-error", String(err));
   }
 });
 
@@ -634,6 +822,30 @@ document.getElementById("btn-save-ciphertext").addEventListener("click", async (
 
 // ---------- Decifra ----------
 
+function showDecryptedImagePreview(result) {
+  lastDecrypted = { bytes: base64ToBytes(result.image_data_base64), filename: result.filename };
+
+  const img = document.getElementById("decrypt-image-preview");
+  const unsupported = document.getElementById("decrypt-image-unsupported");
+
+  if (UNSUPPORTED_PREVIEW_MIMES.has(result.image_mime)) {
+    img.hidden = true;
+    img.src = "";
+    unsupported.hidden = false;
+    return;
+  }
+
+  img.onload = () => {
+    img.hidden = false;
+    unsupported.hidden = true;
+  };
+  img.onerror = () => {
+    img.hidden = true;
+    unsupported.hidden = false;
+  };
+  img.src = `data:${result.image_mime};base64,${result.image_data_base64}`;
+}
+
 function renderDecryptResult(result) {
   lastDecrypted = null;
 
@@ -669,21 +881,7 @@ function renderDecryptResult(result) {
       document.getElementById("plaintext-out").value = result.plaintext;
       textBlock.hidden = false;
     }
-
-    const bytes = base64ToBytes(result.image_data_base64);
-    lastDecrypted = { bytes, filename: result.filename };
-
-    const img = document.getElementById("decrypt-image-preview");
-    const unsupported = document.getElementById("decrypt-image-unsupported");
-    img.onload = () => {
-      img.hidden = false;
-      unsupported.hidden = true;
-    };
-    img.onerror = () => {
-      img.hidden = true;
-      unsupported.hidden = false;
-    };
-    img.src = `data:${result.image_mime};base64,${result.image_data_base64}`;
+    showDecryptedImagePreview(result);
     imageBlock.hidden = false;
   } else {
     lastDecrypted = { bytes: base64ToBytes(result.image_data_base64), filename: result.filename };
@@ -904,6 +1102,33 @@ document.getElementById("btn-remove-identity").addEventListener("click", async (
   } catch (err) {
     setError("remove-error", String(err));
   }
+});
+
+// ---------- Lightbox per l'anteprima immagine ingrandita ----------
+
+function openLightbox(imgEl) {
+  if (imgEl.hidden || !imgEl.src) return;
+  document.getElementById("lightbox-image").src = imgEl.src;
+  document.getElementById("image-lightbox").hidden = false;
+}
+
+function closeLightbox() {
+  document.getElementById("image-lightbox").hidden = true;
+  document.getElementById("lightbox-image").src = "";
+}
+
+document.getElementById("decrypt-image-preview").addEventListener("click", (e) => {
+  openLightbox(e.currentTarget);
+});
+
+document.getElementById("btn-close-lightbox").addEventListener("click", closeLightbox);
+
+document.getElementById("image-lightbox").addEventListener("click", (e) => {
+  if (e.target === e.currentTarget) closeLightbox();
+});
+
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && !document.getElementById("image-lightbox").hidden) closeLightbox();
 });
 
 init();

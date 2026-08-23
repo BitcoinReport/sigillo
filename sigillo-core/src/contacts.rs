@@ -62,10 +62,25 @@ pub fn fingerprint_to_words(fingerprint: &openpgp::Fingerprint) -> Vec<&'static 
 }
 
 /// Un contatto salvato in rubrica, così come persiste su disco.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// I campi aggiunti dopo la prima versione (foto, email, telefono,
+/// note) sono tutti opzionali e con `#[serde(default)]`: una rubrica
+/// salvata prima della loro introduzione continua a caricarsi
+/// correttamente, con questi campi semplicemente assenti (`None`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SavedContact {
     pub name: String,
     pub public_key_armored: String,
+    #[serde(default)]
+    pub photo_base64: Option<String>,
+    #[serde(default)]
+    pub photo_mime: Option<String>,
+    #[serde(default)]
+    pub email: Option<String>,
+    #[serde(default)]
+    pub phone: Option<String>,
+    #[serde(default)]
+    pub notes: Option<String>,
 }
 
 /// Carica la rubrica salvata su disco. Se non è mai stato salvato nulla
@@ -153,6 +168,7 @@ mod tests {
         let contacts = vec![SavedContact {
             name: "Giulia".to_string(),
             public_key_armored: "-----BEGIN PGP PUBLIC KEY BLOCK-----\nfake\n-----END PGP PUBLIC KEY BLOCK-----".to_string(),
+            ..Default::default()
         }];
         save_address_book(&path, &contacts).unwrap();
 
@@ -160,6 +176,49 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].name, "Giulia");
         assert_eq!(loaded[0].public_key_armored, contacts[0].public_key_armored);
+    }
+
+    #[test]
+    fn address_book_round_trip_keeps_optional_details() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("contacts.json");
+
+        let contacts = vec![SavedContact {
+            name: "Giulia".to_string(),
+            public_key_armored: "chiave-di-giulia".to_string(),
+            photo_base64: Some("ZmFrZQ==".to_string()),
+            photo_mime: Some("image/jpeg".to_string()),
+            email: Some("giulia@esempio.it".to_string()),
+            phone: Some("+39 333 1234567".to_string()),
+            notes: Some("Ci siamo conosciuti al lavoro".to_string()),
+        }];
+        save_address_book(&path, &contacts).unwrap();
+
+        let loaded = load_address_book(&path).unwrap();
+        assert_eq!(loaded[0].photo_base64.as_deref(), Some("ZmFrZQ=="));
+        assert_eq!(loaded[0].photo_mime.as_deref(), Some("image/jpeg"));
+        assert_eq!(loaded[0].email.as_deref(), Some("giulia@esempio.it"));
+        assert_eq!(loaded[0].phone.as_deref(), Some("+39 333 1234567"));
+        assert_eq!(loaded[0].notes.as_deref(), Some("Ci siamo conosciuti al lavoro"));
+    }
+
+    #[test]
+    fn address_book_saved_before_optional_fields_still_loads() {
+        // Simula una rubrica scritta da una versione precedente
+        // dell'app, senza i campi foto/email/telefono/note.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("contacts.json");
+        fs::write(
+            &path,
+            r#"[{"name":"Marco","public_key_armored":"chiave-di-marco"}]"#,
+        )
+        .unwrap();
+
+        let loaded = load_address_book(&path).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].name, "Marco");
+        assert_eq!(loaded[0].photo_base64, None);
+        assert_eq!(loaded[0].email, None);
     }
 
     #[test]
@@ -171,6 +230,7 @@ mod tests {
         book.push(SavedContact {
             name: "Giulia".to_string(),
             public_key_armored: "chiave-di-giulia".to_string(),
+            ..Default::default()
         });
         save_address_book(&path, &book).unwrap();
 
@@ -178,6 +238,7 @@ mod tests {
         book.push(SavedContact {
             name: "Marco".to_string(),
             public_key_armored: "chiave-di-marco".to_string(),
+            ..Default::default()
         });
         save_address_book(&path, &book).unwrap();
 
