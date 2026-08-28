@@ -278,6 +278,35 @@ fn combined_text_and_image_round_trip_signed_and_verified() {
 }
 
 #[test]
+fn large_payload_encrypts_and_decrypts_within_a_reasonable_time() {
+    // Simula un video di circa 80 MB: verifica che cifrare/decifrare un
+    // file pesante non richieda un tempo spropositato (l'interfaccia si
+    // affiderebbe a questo stesso percorso, fuori dal thread della UI).
+    let alice = alice();
+    let bob = bob();
+    let data = vec![0xABu8; 80 * 1024 * 1024];
+
+    let start = std::time::Instant::now();
+    let ciphertext = message::encrypt_bytes(
+        &alice.cert,
+        &[bob.cert.clone()],
+        &data,
+        Some("video.mp4"),
+        false,
+        false, // binario, non armato: piu' realistico per un file cosi' grande
+    )
+    .unwrap();
+    let decrypted = message::decrypt_bytes(&bob.cert, &[], &ciphertext).unwrap();
+    let elapsed = start.elapsed();
+
+    assert_eq!(decrypted.data, data);
+    assert!(
+        elapsed.as_secs() < 15,
+        "cifratura+decifratura di 80 MB troppo lenta: {elapsed:?}"
+    );
+}
+
+#[test]
 fn reimported_identity_can_still_decrypt_old_messages() {
     let alice = alice();
     let ciphertext =

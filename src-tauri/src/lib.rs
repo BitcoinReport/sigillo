@@ -501,7 +501,7 @@ fn encrypt_combined(
         .file_name()
         .map(|f| f.to_string_lossy().into_owned());
     let image_mime =
-        detect_image_mime(&image_data).ok_or("formato immagine non riconosciuto")?;
+        detect_media_mime(&image_data).ok_or("formato immagine o video non riconosciuto")?;
 
     let format =
         settings::load_image_format(&settings_path(&app)?).map_err(|e| e.to_string())?;
@@ -523,11 +523,11 @@ fn encrypt_combined(
     Ok(())
 }
 
-/// Riconosce se `data` è un'immagine nei formati comuni guardando i
-/// primi byte (che non cambiano cifrando/decifrando), non l'estensione
-/// del file: funziona anche se il mittente ha usato un altro programma
-/// OpenPGP che non imposta il nome file.
-fn detect_image_mime(data: &[u8]) -> Option<&'static str> {
+/// Riconosce se `data` è un'immagine o un video nei formati comuni
+/// guardando i primi byte (che non cambiano cifrando/decifrando), non
+/// l'estensione del file: funziona anche se il mittente ha usato un
+/// altro programma OpenPGP che non imposta il nome file.
+fn detect_media_mime(data: &[u8]) -> Option<&'static str> {
     if data.starts_with(&[0xFF, 0xD8, 0xFF]) {
         return Some("image/jpeg");
     }
@@ -542,17 +542,103 @@ fn detect_image_mime(data: &[u8]) -> Option<&'static str> {
         ) {
             return Some("image/heic");
         }
+        if brand == b"qt  " {
+            return Some("video/quicktime");
+        }
+        // Le varianti piu' comuni del brand MP4 (ISO Base Media / MPEG-4).
+        if matches!(
+            brand,
+            b"isom" | b"iso2" | b"mp41" | b"mp42" | b"avc1" | b"M4V " | b"M4A " | b"3gp4" | b"3gp5"
+        ) {
+            return Some("video/mp4");
+        }
+    }
+    // Alcuni file .mov piu' vecchi non hanno un box "ftyp" iniziale:
+    // iniziano direttamente con uno dei box QuickTime piu' comuni.
+    if data.len() > 8 && matches!(&data[4..8], b"moov" | b"mdat" | b"free" | b"wide") {
+        return Some("video/quicktime");
     }
     None
 }
 
+/// Sopra questa soglia, un'immagine o un video decifrati non vengono
+/// incorporati come base64 nella risposta (appesantirebbe inutilmente
+/// il trasferimento verso l'interfaccia e il consumo di memoria): si
+/// scrivono invece su un file temporaneo, che l'utente puo' salvare
+/// altrove o aprire con il lettore predefinito del sistema.
+const LARGE_MEDIA_BYTES: usize = 60 * 1024 * 1024;
+
+fn sanitize_filename_component(name: &str) -> String {
+    std::path::Path::new(name)
+        .file_name()
+        .map(|f| f.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+fn write_temp_media_file(data: &[u8], filename: Option<&str>) -> Result<PathBuf, String> {
+    let dir = std::env::temp_dir().join("sigillo-anteprime");
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("impossibile creare la cartella temporanea: {e}"))?;
+
+    let base_name = filename
+        .map(sanitize_filename_component)
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| "file-decifrato".to_string());
+
+    let unique_prefix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let path = dir.join(format!("{}-{}-{}", std::process::id(), unique_prefix, base_name));
+
+    std::fs::write(&path, data).map_err(|e| format!("impossibile salvare l'anteprima: {e}"))?;
+    Ok(path)
+}
+
+/// Rimuove eventuali file temporanei di anteprima rimasti da una
+/// sessione precedente (es. l'utente ha chiuso l'app senza salvare o
+/// aprire un video decifrato): sicuro da fare ad ogni avvio, perche'
+/// ogni decifratura crea sempre un file con un nome nuovo.
+fn cleanup_stale_temp_previews() {
+    let dir = std::env::temp_dir().join("sigillo-anteprime");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Prepara i campi "media" della risposta di decifratura: sotto soglia
+/// il contenuto viene incorporato come base64 (comportamento invariato
+/// per immagini e video di dimensione normale), sopra soglia viene
+/// scritto su file temporaneo. Ritorna (base64, mime, percorso_temp).
+fn media_view_fields(
+    data: &[u8],
+    mime: &str,
+    filename: Option<&str>,
+) -> (Option<String>, Option<String>, Option<String>) {
+    if data.len() > LARGE_MEDIA_BYTES {
+        if let Ok(path) = write_temp_media_file(data, filename) {
+            return (None, Some(mime.to_string()), Some(path.to_string_lossy().into_owned()));
+        }
+        // Se per qualche motivo non si riesce a scrivere il file
+        // temporaneo, ripiega sul base64 invece di far fallire tutto.
+    }
+    (
+        Some(base64::engine::general_purpose::STANDARD.encode(data)),
+        Some(mime.to_string()),
+        None,
+    )
+}
+
 #[derive(Serialize)]
 struct DecryptView {
-    /// "testo", "immagine" o "file" (contenuto binario non riconosciuto).
+    /// "testo", "immagine", "video", "combinato" (testo + immagine/video)
+    /// o "file" (contenuto binario non riconosciuto).
     kind: String,
     plaintext: Option<String>,
     image_data_base64: Option<String>,
     image_mime: Option<String>,
+    /// Presente solo per immagini/video sopra `LARGE_MEDIA_BYTES`: al
+    /// posto di `image_data_base64`, il percorso di un file temporaneo
+    /// gia' scritto su disco.
+    media_temp_path: Option<String>,
     filename: Option<String>,
     signature_status: String,
     signer_fingerprint: Option<String>,
@@ -572,18 +658,22 @@ fn build_decrypt_view(
     };
 
     // Va controllato prima degli altri due casi: un pacchetto combinato
-    // non ha i byte magici di un'immagine pura, ma per puro caso i suoi
-    // byte potrebbero comunque risultare UTF-8 valido, finendo scambiati
-    // per testo semplice se non lo si riconosce per primo.
+    // non ha i byte magici di un'immagine/video puro, ma per puro caso
+    // i suoi byte potrebbero comunque risultare UTF-8 valido, finendo
+    // scambiati per testo semplice se non lo si riconosce per primo.
     if sigillo_core::composite::is_combined(&data) {
         if let Ok(combined) = sigillo_core::composite::decode(&data) {
+            let (image_data_base64, image_mime, media_temp_path) = media_view_fields(
+                &combined.image_data,
+                &combined.image_mime,
+                combined.image_filename.as_deref(),
+            );
             return DecryptView {
                 kind: "combinato".to_string(),
                 plaintext: Some(combined.text),
-                image_data_base64: Some(
-                    base64::engine::general_purpose::STANDARD.encode(&combined.image_data),
-                ),
-                image_mime: Some(combined.image_mime),
+                image_data_base64,
+                image_mime,
+                media_temp_path,
                 filename: combined.image_filename,
                 signature_status,
                 signer_fingerprint,
@@ -593,12 +683,16 @@ fn build_decrypt_view(
         // trattarlo come gli altri casi, invece di far fallire tutto.
     }
 
-    if let Some(mime) = detect_image_mime(&data) {
+    if let Some(mime) = detect_media_mime(&data) {
+        let kind = if mime.starts_with("video/") { "video" } else { "immagine" };
+        let (image_data_base64, image_mime, media_temp_path) =
+            media_view_fields(&data, mime, filename.as_deref());
         return DecryptView {
-            kind: "immagine".to_string(),
+            kind: kind.to_string(),
             plaintext: None,
-            image_data_base64: Some(base64::engine::general_purpose::STANDARD.encode(&data)),
-            image_mime: Some(mime.to_string()),
+            image_data_base64,
+            image_mime,
+            media_temp_path,
             filename,
             signature_status,
             signer_fingerprint,
@@ -611,6 +705,7 @@ fn build_decrypt_view(
             plaintext: Some(text),
             image_data_base64: None,
             image_mime: None,
+            media_temp_path: None,
             filename,
             signature_status,
             signer_fingerprint,
@@ -622,10 +717,24 @@ fn build_decrypt_view(
         plaintext: None,
         image_data_base64: Some(base64::engine::general_purpose::STANDARD.encode(&data)),
         image_mime: None,
+        media_temp_path: None,
         filename,
         signature_status,
         signer_fingerprint,
     }
+}
+
+/// Copia un file temporaneo di anteprima (vedi `media_view_fields`)
+/// nella destinazione scelta dall'utente, e prova a ripulire il
+/// temporaneo dopo: usato dal pulsante "Salva..." quando la
+/// decifratura di un'immagine/video di grandi dimensioni non ha
+/// incorporato i byte nella risposta.
+#[tauri::command]
+fn save_temp_media(temp_path: String, dest_path: String) -> Result<(), String> {
+    std::fs::copy(&temp_path, &dest_path)
+        .map_err(|e| format!("impossibile salvare il file: {e}"))?;
+    let _ = std::fs::remove_file(&temp_path);
+    Ok(())
 }
 
 /// Decifra un contenuto incollato come testo (funziona sia per un
@@ -682,6 +791,8 @@ fn decrypt_file(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    cleanup_stale_temp_previews();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
@@ -709,7 +820,99 @@ pub fn run() {
             encrypt_combined,
             decrypt_message,
             decrypt_file,
+            save_temp_media,
         ])
         .run(tauri::generate_context!())
         .expect("errore durante l'avvio di Sigillo");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_mp4_via_ftyp_isom_brand() {
+        let mut data = vec![0u8; 4];
+        data.extend_from_slice(b"ftyp");
+        data.extend_from_slice(b"isom");
+        data.extend_from_slice(&[0u8; 20]);
+        assert_eq!(detect_media_mime(&data), Some("video/mp4"));
+    }
+
+    #[test]
+    fn detects_mov_via_ftyp_qt_brand() {
+        let mut data = vec![0u8; 4];
+        data.extend_from_slice(b"ftyp");
+        data.extend_from_slice(b"qt  ");
+        data.extend_from_slice(&[0u8; 20]);
+        assert_eq!(detect_media_mime(&data), Some("video/quicktime"));
+    }
+
+    #[test]
+    fn detects_older_mov_without_ftyp_box() {
+        let mut data = vec![0u8; 4];
+        data.extend_from_slice(b"moov");
+        data.extend_from_slice(&[0u8; 20]);
+        assert_eq!(detect_media_mime(&data), Some("video/quicktime"));
+    }
+
+    #[test]
+    fn still_detects_images_unaffected_by_video_support() {
+        assert_eq!(
+            detect_media_mime(&[0xFF, 0xD8, 0xFF, 0, 0]),
+            Some("image/jpeg")
+        );
+    }
+
+    #[test]
+    fn plain_text_is_not_detected_as_media() {
+        assert_eq!(detect_media_mime(b"ciao, sono testo normale"), None);
+    }
+
+    #[test]
+    fn small_media_is_embedded_as_base64_not_temp_file() {
+        let (b64, mime, temp) = media_view_fields(&[1, 2, 3, 4], "image/png", Some("foto.png"));
+        assert!(b64.is_some());
+        assert_eq!(mime.as_deref(), Some("image/png"));
+        assert!(temp.is_none());
+    }
+
+    #[test]
+    fn large_media_is_written_to_a_temp_file_not_base64() {
+        let data = vec![0xABu8; LARGE_MEDIA_BYTES + 1];
+        let (b64, mime, temp) = media_view_fields(&data, "video/mp4", Some("clip.mp4"));
+        assert!(b64.is_none());
+        assert_eq!(mime.as_deref(), Some("video/mp4"));
+        let path = temp.expect("doveva scrivere un file temporaneo");
+        let written = std::fs::read(&path).unwrap();
+        assert_eq!(written, data);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn temp_filename_has_no_directory_traversal_from_embedded_filename() {
+        let path = write_temp_media_file(&[1, 2, 3], Some("../../etc/passwd")).unwrap();
+        assert!(!path.to_string_lossy().contains(".."));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn save_temp_media_copies_and_cleans_up_the_source() {
+        let dir = std::env::temp_dir().join("sigillo-test-save-temp-media");
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("sorgente.bin");
+        let dest = dir.join("destinazione.bin");
+        std::fs::write(&src, b"contenuto di prova").unwrap();
+
+        save_temp_media(
+            src.to_string_lossy().into_owned(),
+            dest.to_string_lossy().into_owned(),
+        )
+        .unwrap();
+
+        assert_eq!(std::fs::read(&dest).unwrap(), b"contenuto di prova");
+        assert!(!src.exists(), "il file temporaneo va ripulito dopo la copia");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

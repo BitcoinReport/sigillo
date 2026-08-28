@@ -177,6 +177,7 @@
       </nav>
 
       <div id="tab-write" class="tab-panel active">
+        <div class="write-layout">
         <div class="card">
           <h2>Nuovo messaggio</h2>
 
@@ -188,20 +189,24 @@
           <label for="message-text">Messaggio (facoltativo se alleghi un'immagine)</label>
           <textarea id="message-text" rows="8" placeholder="Scrivi qui il tuo messaggio..."></textarea>
 
-          <label>Immagine (facoltativa)</label>
+          <label>Immagine o video (facoltativo)</label>
           <div id="image-dropzone" class="dropzone">
             <div id="image-dropzone-prompt">
-              <p class="hint">Trascina qui una foto (JPG, PNG o HEIC), oppure</p>
-              <button id="btn-choose-image" class="secondary" type="button">Scegli immagine...</button>
+              <p class="hint">Trascina qui una foto o un video (JPG, PNG, HEIC, MOV o MP4), oppure</p>
+              <button id="btn-choose-image" class="secondary" type="button">Scegli file...</button>
             </div>
             <div id="image-preview-wrap" hidden>
-              <img id="image-preview" alt="Anteprima dell'immagine allegata" />
+              <img id="image-preview" alt="Anteprima dell'immagine allegata" hidden />
+              <video id="attach-video-preview" controls playsinline hidden></video>
               <p id="image-preview-unsupported" class="hint" hidden>
                 Non riesco a mostrare l'anteprima di questo formato, ma il
                 file verrà comunque cifrato correttamente.
               </p>
+              <p id="attach-media-toolarge-hint" class="hint" hidden>
+                File di grandi dimensioni (<span id="attach-media-toolarge-size"></span>): anteprima non mostrata, ma verrà comunque cifrato correttamente. La cifratura potrebbe richiedere qualche istante in più.
+              </p>
               <p id="image-preview-name" class="hint"></p>
-              <button id="btn-remove-image" class="secondary" type="button">Rimuovi immagine</button>
+              <button id="btn-remove-image" class="secondary" type="button">Rimuovi file</button>
             </div>
           </div>
 
@@ -234,6 +239,59 @@
 
           <p id="encrypt-error" class="error" hidden></p>
         </div>
+
+        <svg id="write-decoration" class="write-decoration" viewBox="0 0 215 150" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" focusable="false">
+          <defs>
+            <linearGradient id="deco-block1" x1="0" y1="0" x2="1" y2="1">
+              <stop offset="0" stop-color="#d9a441" />
+              <stop offset="1" stop-color="#c97a3a" />
+            </linearGradient>
+            <linearGradient id="deco-block2" x1="0" y1="0" x2="1" y2="1">
+              <stop offset="0" stop-color="#cf7a4a" />
+              <stop offset="1" stop-color="#b6532f" />
+            </linearGradient>
+            <linearGradient id="deco-central" x1="0" y1="0" x2="1" y2="1">
+              <stop offset="0" stop-color="#8b5cf6" />
+              <stop offset="1" stop-color="#3b5cf5" />
+            </linearGradient>
+          </defs>
+
+          <!-- Blocco futuro, ~20 min -->
+          <text x="18" y="72" font-size="6.5" fill="#9a9587" text-anchor="middle" font-family="ui-monospace, monospace">IN ~20 MIN</text>
+          <polygon points="2,80 34,80 41,73 9,73" fill="#e8ba6a" />
+          <polygon points="34,80 34,118 41,111 41,73" fill="#a85f2a" />
+          <rect x="2" y="80" width="32" height="38" rx="3" fill="url(#deco-block1)" />
+
+          <!-- Blocco futuro, ~10 min -->
+          <text x="58" y="72" font-size="6.5" fill="#9a9587" text-anchor="middle" font-family="ui-monospace, monospace">IN ~10 MIN</text>
+          <polygon points="42,80 74,80 81,73 49,73" fill="#dd9a72" />
+          <polygon points="74,80 74,118 81,111 81,73" fill="#8f3f22" />
+          <rect x="42" y="80" width="32" height="38" rx="3" fill="url(#deco-block2)" />
+
+          <!-- Separatore tratteggiato -->
+          <line x1="86" y1="55" x2="86" y2="128" stroke="#6b6558" stroke-width="1" stroke-dasharray="3 3" opacity="0.5" />
+
+          <!-- Blocco centrale in evidenza -->
+          <polygon points="96,68 136,68 145,58 105,58" fill="#ac8bfa" />
+          <polygon points="136,68 136,118 145,108 145,58" fill="#2a3fb0" />
+          <rect x="96" y="68" width="40" height="50" rx="4" fill="url(#deco-central)" stroke="#c4b0fb" stroke-width="1.5" />
+          <text x="116" y="97" font-size="9" font-weight="700" fill="#ffffff" text-anchor="middle" font-family="ui-monospace, monospace">964.189</text>
+          <rect x="91" y="122" width="50" height="15" rx="7.5" fill="#22c55e" />
+          <text x="116" y="132.5" font-size="6.5" font-weight="600" fill="#0c1210" text-anchor="middle" font-family="-apple-system, sans-serif">1 conferma</text>
+
+          <!-- Blocchi ulteriori, piu' lontani nel tempo -->
+          <g opacity="0.75">
+            <polygon points="146,84 174,84 180,78 152,78" fill="#ac8bfa" />
+            <polygon points="174,84 174,118 180,112 180,78" fill="#2a3fb0" />
+            <rect x="146" y="84" width="28" height="34" rx="3" fill="url(#deco-central)" />
+          </g>
+          <g opacity="0.55">
+            <polygon points="180,88 204,88 210,83 186,83" fill="#ac8bfa" />
+            <polygon points="204,88 204,118 210,113 210,83" fill="#2a3fb0" />
+            <rect x="180" y="88" width="24" height="30" rx="3" fill="url(#deco-central)" />
+          </g>
+        </svg>
+        </div>
       </div>
 
       <div id="tab-decrypt" class="tab-panel">
@@ -255,13 +313,24 @@
             </div>
 
             <div id="decrypt-result-image" hidden>
-              <img id="decrypt-image-preview" alt="Immagine decifrata" />
+              <img id="decrypt-image-preview" alt="Immagine decifrata" hidden />
+              <video id="decrypt-video-preview" controls playsinline hidden></video>
               <p id="decrypt-image-unsupported" class="hint" hidden>
                 Non riesco a mostrare l'anteprima di questo formato, ma
                 puoi comunque salvare il file.
               </p>
+              <div id="decrypt-media-large" hidden>
+                <p class="hint">
+                  File di grandi dimensioni (<span id="decrypt-media-large-name"></span>):
+                  anteprima non mostrata, ma puoi salvarlo o aprirlo con
+                  il lettore predefinito del tuo computer.
+                </p>
+                <div class="button-row">
+                  <button id="btn-open-decrypted-video" class="secondary">Apri con il lettore predefinito</button>
+                </div>
+              </div>
               <div class="button-row">
-                <button id="btn-save-decrypted-image" class="secondary">Salva immagine...</button>
+                <button id="btn-save-decrypted-image" class="secondary">Salva...</button>
               </div>
             </div>
 

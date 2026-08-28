@@ -1,8 +1,9 @@
 const { invoke } = window.__TAURI__.core;
 const { save, open } = window.__TAURI__.dialog;
-const { writeTextFile, writeFile, readFile } = window.__TAURI__.fs;
+const { writeTextFile, writeFile, readFile, size } = window.__TAURI__.fs;
 const { writeText } = window.__TAURI__.clipboardManager;
 const { getCurrentWebview } = window.__TAURI__.webview;
+const { openPath } = window.__TAURI__.opener;
 
 /** @type {{name: string, key: string, fingerprintHex: string, fingerprintWords: string[], email: string|null, phone: string|null, notes: string|null, photoBase64: string|null, photoMime: string|null}[]} */
 const contacts = [];
@@ -33,14 +34,21 @@ function contactFromView(view) {
   };
 }
 
-// Immagine allegata nella scheda "Scrivi", in attesa di essere cifrata.
+// Immagine o video allegato nella scheda "Scrivi", in attesa di essere
+// cifrato/a (il nome della variabile e' storico, da quando esistevano
+// solo immagini: vale anche per i video).
 let attachedImagePath = null;
+let attachedImageIsVideo = false;
 let attachedImagePreviewUrl = null;
 
-// Ultimo risultato di una decifratura non testuale (immagine o file
-// generico), tenuto pronto per il bottone "Salva...".
-let lastDecrypted = null; // { bytes: Uint8Array, filename: string | null }
+// Ultimo risultato di una decifratura non testuale (immagine, video o
+// file generico), tenuto pronto per il bottone "Salva...": o i byte
+// gia' in memoria, o il percorso di un file temporaneo (per i file
+// grandi, vedi LARGE_MEDIA_BYTES).
+let lastDecrypted = null; // { bytes, filename } oppure { tempPath, filename }
 
+// Solo immagini: usata per la foto profilo dei contatti, dove i video
+// non hanno senso.
 const IMAGE_MIME_BY_EXTENSION = {
   jpg: "image/jpeg",
   jpeg: "image/jpeg",
@@ -49,9 +57,35 @@ const IMAGE_MIME_BY_EXTENSION = {
   heif: "image/heif",
 };
 
+const VIDEO_MIME_BY_EXTENSION = {
+  mov: "video/quicktime",
+  mp4: "video/mp4",
+};
+
+// Immagini e video insieme: usata per l'allegato nella scheda "Scrivi"
+// e per il filtro del selettore file in "Decifra".
+const MEDIA_MIME_BY_EXTENSION = { ...IMAGE_MIME_BY_EXTENSION, ...VIDEO_MIME_BY_EXTENSION };
+
 function guessImageMime(filename) {
   const ext = (filename || "").split(".").pop().toLowerCase();
   return IMAGE_MIME_BY_EXTENSION[ext] || null;
+}
+
+function guessMediaMime(filename) {
+  const ext = (filename || "").split(".").pop().toLowerCase();
+  return MEDIA_MIME_BY_EXTENSION[ext] || null;
+}
+
+// Sopra questa soglia (allineata a LARGE_MEDIA_BYTES nel backend Rust):
+// in "Scrivi" non si genera un'anteprima (evita di far transitare un
+// file enorme attraverso il ponte JS/Rust solo per mostrarlo); in
+// "Decifra" il contenuto arriva come percorso di file temporaneo
+// invece che come base64 incorporato nella risposta.
+const LARGE_MEDIA_BYTES = 60 * 1024 * 1024;
+
+function formatFileSize(bytes) {
+  if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024))} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 function base64ToBytes(base64) {
@@ -284,42 +318,79 @@ function resetAppToFirstRunState() {
 
 async function setAttachedImage(path) {
   const filename = path.split(/[\\/]/).pop();
-  const mime = guessImageMime(filename);
+  const mime = guessMediaMime(filename);
   if (!mime) {
-    setError("encrypt-error", "Formato non supportato: usa un'immagine JPG, PNG o HEIC.");
+    setError(
+      "encrypt-error",
+      "Formato non supportato: usa un'immagine (JPG, PNG, HEIC) o un video (MOV, MP4)."
+    );
     return;
   }
   setError("encrypt-error", null);
+  const isVideo = mime.startsWith("video/");
 
-  let bytes;
+  let fileSize = null;
   try {
-    bytes = await readFile(path);
-  } catch (err) {
-    setError("encrypt-error", String(err));
-    return;
+    fileSize = await size(path);
+  } catch {
+    // Se il controllo della dimensione fallisce non blocchiamo
+    // l'allegato: si procede semplicemente come se fosse piccolo.
   }
 
-  if (attachedImagePreviewUrl) URL.revokeObjectURL(attachedImagePreviewUrl);
-  attachedImagePreviewUrl = URL.createObjectURL(new Blob([bytes], { type: mime }));
   attachedImagePath = path;
+  attachedImageIsVideo = isVideo;
 
   const img = document.getElementById("image-preview");
+  const video = document.getElementById("attach-video-preview");
   const unsupported = document.getElementById("image-preview-unsupported");
-  if (UNSUPPORTED_PREVIEW_MIMES.has(mime)) {
-    img.hidden = true;
-    img.src = "";
+  const tooLarge = document.getElementById("attach-media-toolarge-hint");
+
+  img.hidden = true;
+  img.src = "";
+  video.pause();
+  video.removeAttribute("src");
+  video.hidden = true;
+  unsupported.hidden = true;
+  tooLarge.hidden = true;
+  if (attachedImagePreviewUrl) {
+    URL.revokeObjectURL(attachedImagePreviewUrl);
+    attachedImagePreviewUrl = null;
+  }
+
+  if (fileSize !== null && fileSize > LARGE_MEDIA_BYTES) {
+    // Evita di far transitare un file enorme attraverso il ponte
+    // JS/Rust solo per generarne un'anteprima: la cifratura vera e
+    // propria legge comunque il file direttamente dal percorso su
+    // disco, quindi funziona a prescindere dalla dimensione.
+    document.getElementById("attach-media-toolarge-size").textContent = formatFileSize(fileSize);
+    tooLarge.hidden = false;
+  } else if (!isVideo && UNSUPPORTED_PREVIEW_MIMES.has(mime)) {
     unsupported.hidden = false;
   } else {
-    img.onload = () => {
-      img.hidden = false;
-      unsupported.hidden = true;
-    };
-    img.onerror = () => {
-      img.hidden = true;
-      unsupported.hidden = false;
-    };
-    img.src = attachedImagePreviewUrl;
+    let bytes;
+    try {
+      bytes = await readFile(path);
+    } catch (err) {
+      setError("encrypt-error", String(err));
+      return;
+    }
+    attachedImagePreviewUrl = URL.createObjectURL(new Blob([bytes], { type: mime }));
+    if (isVideo) {
+      video.src = attachedImagePreviewUrl;
+      video.hidden = false;
+    } else {
+      img.onload = () => {
+        img.hidden = false;
+        unsupported.hidden = true;
+      };
+      img.onerror = () => {
+        img.hidden = true;
+        unsupported.hidden = false;
+      };
+      img.src = attachedImagePreviewUrl;
+    }
   }
+
   document.getElementById("image-preview-name").textContent = filename;
   document.getElementById("image-preview-wrap").hidden = false;
   document.getElementById("image-dropzone-prompt").hidden = true;
@@ -331,6 +402,12 @@ function clearAttachedImage() {
     attachedImagePreviewUrl = null;
   }
   attachedImagePath = null;
+  attachedImageIsVideo = false;
+  const video = document.getElementById("attach-video-preview");
+  video.pause();
+  video.removeAttribute("src");
+  video.hidden = true;
+  document.getElementById("attach-media-toolarge-hint").hidden = true;
   document.getElementById("image-preview-wrap").hidden = true;
   document.getElementById("image-dropzone-prompt").hidden = false;
 }
@@ -338,7 +415,9 @@ function clearAttachedImage() {
 document.getElementById("btn-choose-image").addEventListener("click", async () => {
   const path = await open({
     multiple: false,
-    filters: [{ name: "Immagini", extensions: ["jpg", "jpeg", "png", "heic", "heif"] }],
+    filters: [
+      { name: "Immagini e video", extensions: ["jpg", "jpeg", "png", "heic", "heif", "mov", "mp4"] },
+    ],
   });
   if (path) await setAttachedImage(path);
 });
@@ -762,7 +841,7 @@ document.getElementById("btn-encrypt").addEventListener("click", async (e) => {
         const ext = currentImageFormat === "gpg" ? "gpg" : "asc";
         const outputPath = await save({
           defaultPath: `${sourceName}.${ext}`,
-          filters: [{ name: "Immagine cifrata", extensions: [ext] }],
+          filters: [{ name: "File cifrato", extensions: [ext] }],
         });
         if (outputPath) {
           await invoke("encrypt_image", {
@@ -772,7 +851,7 @@ document.getElementById("btn-encrypt").addEventListener("click", async (e) => {
             sign,
           });
           document.getElementById("encrypt-image-result-label").textContent =
-            "Immagine cifrata salvata:";
+            "File cifrato salvato:";
           document.getElementById("encrypt-image-saved-path").textContent = outputPath;
           document.getElementById("encrypt-image-result").hidden = false;
           imageDone = true;
@@ -822,15 +901,40 @@ document.getElementById("btn-save-ciphertext").addEventListener("click", async (
 
 // ---------- Decifra ----------
 
-function showDecryptedImagePreview(result) {
+function showDecryptedMedia(result) {
+  const img = document.getElementById("decrypt-image-preview");
+  const video = document.getElementById("decrypt-video-preview");
+  const unsupported = document.getElementById("decrypt-image-unsupported");
+  const largeBlock = document.getElementById("decrypt-media-large");
+  const isVideo = (result.image_mime || "").startsWith("video/");
+
+  img.hidden = true;
+  img.src = "";
+  video.pause();
+  video.removeAttribute("src");
+  video.hidden = true;
+  unsupported.hidden = true;
+  largeBlock.hidden = true;
+
+  if (result.media_temp_path) {
+    // File grande: il backend non ha incorporato i byte nella
+    // risposta, solo il percorso di un file temporaneo gia' su disco.
+    lastDecrypted = { tempPath: result.media_temp_path, filename: result.filename };
+    document.getElementById("decrypt-media-large-name").textContent =
+      result.filename || (isVideo ? "video decifrato" : "file decifrato");
+    largeBlock.hidden = false;
+    return;
+  }
+
   lastDecrypted = { bytes: base64ToBytes(result.image_data_base64), filename: result.filename };
 
-  const img = document.getElementById("decrypt-image-preview");
-  const unsupported = document.getElementById("decrypt-image-unsupported");
+  if (isVideo) {
+    video.src = `data:${result.image_mime};base64,${result.image_data_base64}`;
+    video.hidden = false;
+    return;
+  }
 
   if (UNSUPPORTED_PREVIEW_MIMES.has(result.image_mime)) {
-    img.hidden = true;
-    img.src = "";
     unsupported.hidden = false;
     return;
   }
@@ -876,12 +980,12 @@ function renderDecryptResult(result) {
   if (result.kind === "testo") {
     document.getElementById("plaintext-out").value = result.plaintext;
     textBlock.hidden = false;
-  } else if (result.kind === "immagine" || result.kind === "combinato") {
+  } else if (result.kind === "immagine" || result.kind === "video" || result.kind === "combinato") {
     if (result.kind === "combinato") {
       document.getElementById("plaintext-out").value = result.plaintext;
       textBlock.hidden = false;
     }
-    showDecryptedImagePreview(result);
+    showDecryptedMedia(result);
     imageBlock.hidden = false;
   } else {
     lastDecrypted = { bytes: base64ToBytes(result.image_data_base64), filename: result.filename };
@@ -937,15 +1041,29 @@ async function saveLastDecrypted(defaultName) {
   if (!lastDecrypted) return;
   const suggested = lastDecrypted.filename || defaultName;
   const path = await save({ defaultPath: suggested });
-  if (path) await writeFile(path, lastDecrypted.bytes);
+  if (!path) return;
+  if (lastDecrypted.tempPath) {
+    await invoke("save_temp_media", { tempPath: lastDecrypted.tempPath, destPath: path });
+  } else {
+    await writeFile(path, lastDecrypted.bytes);
+  }
 }
 
 document.getElementById("btn-save-decrypted-image").addEventListener("click", () => {
-  saveLastDecrypted("immagine-decifrata");
+  saveLastDecrypted("file-decifrato");
 });
 
 document.getElementById("btn-save-decrypted-file").addEventListener("click", () => {
   saveLastDecrypted("file-decifrato");
+});
+
+document.getElementById("btn-open-decrypted-video").addEventListener("click", async () => {
+  if (!lastDecrypted?.tempPath) return;
+  try {
+    await openPath(lastDecrypted.tempPath);
+  } catch (err) {
+    setError("decrypt-error", String(err));
+  }
 });
 
 // ---------- Identita ----------

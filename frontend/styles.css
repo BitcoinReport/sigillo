@@ -418,6 +418,29 @@ details summary {
   margin: 0;
 }
 
+.write-layout {
+  display: flex;
+  gap: 1.5rem;
+  align-items: flex-start;
+  justify-content: center;
+  width: 100%;
+}
+
+/* Puramente decorativo (nessuna interazione, nessun dato reale): si
+   nasconde del tutto sotto una certa larghezza invece di andare a
+   capo, per non compromettere mai la leggibilita' del modulo. */
+.write-decoration {
+  flex-shrink: 0;
+  width: 200px;
+  margin-top: 2.75rem;
+}
+
+@media (max-width: 960px) {
+  .write-decoration {
+    display: none;
+  }
+}
+
 .dropzone {
   border: 2px dashed var(--border);
   border-radius: 10px;
@@ -453,7 +476,9 @@ details summary {
 }
 
 #image-preview,
-#decrypt-image-preview {
+#decrypt-image-preview,
+#attach-video-preview,
+#decrypt-video-preview {
   max-width: 100%;
   max-height: 220px;
   border-radius: 8px;
