@@ -16,6 +16,7 @@ use zeroize::Zeroizing;
 use sequoia_openpgp as openpgp;
 use openpgp::packet::key::{Key4, PrimaryRole, SecretParts, SubordinateRole};
 use openpgp::packet::prelude::*;
+use openpgp::parse::Parse;
 use openpgp::types::{KeyFlags, SignatureType};
 use openpgp::Cert;
 
@@ -55,24 +56,33 @@ fn key_ctime() -> SystemTime {
     UNIX_EPOCH + Duration::from_secs(KEY_CTIME_UNIX)
 }
 
-/// Un'identità Sigillo: la seed phrase BIP39 e il certificato OpenPGP
-/// (comprensivo di materiale segreto) da essa derivato.
+/// Un'identità Sigillo: il certificato OpenPGP (comprensivo di materiale
+/// segreto), e se generata/reimportata da Sigillo tramite seed phrase
+/// BIP39, anche il mnemonic da cui è derivata. Un'identità importata da
+/// una chiave OpenPGP generata altrove (GPG Suite, Kleopatra, terminale)
+/// non ha una seed phrase Sigillo: per quella va conservato invece il
+/// file della chiave stessa (vedi `storage::EntrySource::ImportedTsk`).
+#[derive(Debug)]
 pub struct Identity {
-    pub mnemonic: Mnemonic,
+    pub mnemonic: Option<Mnemonic>,
     pub cert: Cert,
 }
 
 impl Identity {
     /// Rappresentazione testuale della seed phrase (parole separate da
     /// spazi), da mostrare all'utente durante il wizard di conferma.
-    pub fn seed_phrase(&self) -> String {
-        self.mnemonic.words().collect::<Vec<_>>().join(" ")
+    /// `None` per un'identità importata da una chiave esterna.
+    pub fn seed_phrase(&self) -> Option<String> {
+        self.mnemonic
+            .as_ref()
+            .map(|m| m.words().collect::<Vec<_>>().join(" "))
     }
 
     /// Le singole parole della seed phrase, utile per la schermata di
     /// conferma dove all'utente vengono chieste solo alcune parole a caso.
-    pub fn seed_words(&self) -> Vec<&'static str> {
-        self.mnemonic.words().collect()
+    /// `None` per un'identità importata da una chiave esterna.
+    pub fn seed_words(&self) -> Option<Vec<&'static str>> {
+        self.mnemonic.as_ref().map(|m| m.words().collect())
     }
 }
 
@@ -152,7 +162,10 @@ fn build_cert(seed64: &[u8; 64], display_name: &str) -> Result<Cert> {
 fn from_mnemonic(mnemonic: Mnemonic, display_name: &str) -> Result<Identity> {
     let seed = Zeroizing::new(mnemonic.to_seed(""));
     let cert = build_cert(&seed, display_name)?;
-    Ok(Identity { mnemonic, cert })
+    Ok(Identity {
+        mnemonic: Some(mnemonic),
+        cert,
+    })
 }
 
 /// Genera una nuova identità casuale, con seed phrase inglese BIP39.
@@ -171,6 +184,71 @@ pub fn import(phrase: &str, display_name: &str) -> Result<Identity> {
         "seed phrase non valida: controlla di aver scritto correttamente tutte le parole, nell'ordine giusto",
     )?;
     from_mnemonic(mnemonic, display_name)
+}
+
+/// Importa una chiave privata OpenPGP generata altrove (GPG Suite,
+/// Kleopatra, un terminale con GnuPG...), in formato ASCII armored.
+/// Non ha una seed phrase Sigillo associata: `Identity::seed_phrase()`
+/// restituirà `None` per il risultato.
+///
+/// Se il materiale segreto della chiave è protetto da una sua
+/// passphrase originale, va fornita per poterlo sbloccare: da questo
+/// momento in poi non serve più, perché Sigillo lo protegge di nuovo a
+/// modo suo nel proprio vault cifrato (la stessa passphrase locale che
+/// protegge le altre identità sul dispositivo).
+pub fn import_external(armored_tsk: &[u8], original_passphrase: Option<&str>) -> Result<Identity> {
+    let cert = Cert::from_bytes(armored_tsk)
+        .context("il file non contiene una chiave OpenPGP valida")?;
+    if !cert.is_tsk() {
+        anyhow::bail!(
+            "questo file contiene solo una chiave pubblica: serve il file con la chiave privata completa"
+        );
+    }
+
+    let cert = unlock_secret_material(cert, original_passphrase)?;
+    Ok(Identity { mnemonic: None, cert })
+}
+
+/// Decifra (se necessario) il materiale segreto di tutte le chiavi
+/// (primaria e sottochiavi) di `cert` con `passphrase`, restituendo un
+/// certificato con il materiale segreto pronto all'uso. Se una chiave
+/// non è protetta da passphrase, viene lasciata così com'è.
+fn unlock_secret_material(cert: Cert, passphrase: Option<&str>) -> Result<Cert> {
+    let password: Option<openpgp::crypto::Password> = passphrase.map(|p| p.to_owned().into());
+
+    let packets: Vec<openpgp::Packet> = cert
+        .into_tsk()
+        .into_packets()
+        .map(|packet| match packet {
+            openpgp::Packet::SecretKey(mut key) => {
+                if key.secret().is_encrypted() {
+                    let pw = password.as_ref().context(
+                        "questa chiave è protetta da una passphrase: inseriscila per importarla",
+                    )?;
+                    let pk_algo = key.pk_algo();
+                    key.secret_mut()
+                        .decrypt_in_place(pk_algo, pw)
+                        .map_err(|_| anyhow::anyhow!("passphrase della chiave errata"))?;
+                }
+                Ok(openpgp::Packet::SecretKey(key))
+            }
+            openpgp::Packet::SecretSubkey(mut key) => {
+                if key.secret().is_encrypted() {
+                    let pw = password.as_ref().context(
+                        "questa chiave è protetta da una passphrase: inseriscila per importarla",
+                    )?;
+                    let pk_algo = key.pk_algo();
+                    key.secret_mut()
+                        .decrypt_in_place(pk_algo, pw)
+                        .map_err(|_| anyhow::anyhow!("passphrase della chiave errata"))?;
+                }
+                Ok(openpgp::Packet::SecretSubkey(key))
+            }
+            other => Ok(other),
+        })
+        .collect::<Result<_>>()?;
+
+    Cert::try_from(packets).context("errore interno durante l'importazione della chiave")
 }
 
 /// Esporta la chiave privata come file OpenPGP classico (ASCII armored),
@@ -223,16 +301,16 @@ mod tests {
     #[test]
     fn generate_produces_12_and_24_words() {
         let id12 = generate(SeedWordCount::Twelve, "Test").unwrap();
-        assert_eq!(id12.seed_words().len(), 12);
+        assert_eq!(id12.seed_words().unwrap().len(), 12);
 
         let id24 = generate(SeedWordCount::TwentyFour, "Test").unwrap();
-        assert_eq!(id24.seed_words().len(), 24);
+        assert_eq!(id24.seed_words().unwrap().len(), 24);
     }
 
     #[test]
     fn reimporting_the_same_phrase_yields_the_same_fingerprint() {
         let original = generate(SeedWordCount::TwentyFour, "Alice").unwrap();
-        let phrase = original.seed_phrase();
+        let phrase = original.seed_phrase().unwrap();
 
         // Stesso nome visualizzato: deve rigenerare esattamente la stessa identità.
         let reimported = import(&phrase, "Alice").unwrap();
@@ -262,6 +340,71 @@ mod tests {
     #[test]
     fn rejects_garbage_seed_phrase() {
         assert!(import("questa non è una seed phrase valida", "Test").is_err());
+    }
+
+    #[test]
+    fn import_external_accepts_a_password_protected_key_and_unlocks_it() {
+        // Simula una chiave generata "altrove" (GPG Suite, Kleopatra,
+        // terminale...): stesso formato ASCII armored protetto da
+        // passphrase prodotto da export_private_key_file.
+        let original = generate(SeedWordCount::Twelve, "Alice").unwrap();
+        let exported = export_private_key_file(&original.cert, "passphrase-della-chiave").unwrap();
+
+        let imported =
+            import_external(exported.as_bytes(), Some("passphrase-della-chiave")).unwrap();
+        assert_eq!(imported.cert.fingerprint(), original.cert.fingerprint());
+        assert!(imported.mnemonic.is_none());
+
+        // Il materiale segreto deve essere davvero utilizzabile (non piu'
+        // cifrato) dopo l'import, non solo "presente".
+        let primary_secret = imported
+            .cert
+            .keys()
+            .secret()
+            .next()
+            .expect("la chiave importata deve avere materiale segreto");
+        assert!(!primary_secret.key().secret().is_encrypted());
+    }
+
+    #[test]
+    fn import_external_rejects_wrong_passphrase() {
+        let original = generate(SeedWordCount::Twelve, "Alice").unwrap();
+        let exported = export_private_key_file(&original.cert, "passphrase-corretta").unwrap();
+
+        let err = import_external(exported.as_bytes(), Some("passphrase-sbagliata")).unwrap_err();
+        assert!(err.to_string().contains("passphrase"));
+    }
+
+    #[test]
+    fn import_external_reports_missing_passphrase_clearly() {
+        let original = generate(SeedWordCount::Twelve, "Alice").unwrap();
+        let exported = export_private_key_file(&original.cert, "passphrase-della-chiave").unwrap();
+
+        let err = import_external(exported.as_bytes(), None).unwrap_err();
+        assert!(err.to_string().contains("passphrase"));
+    }
+
+    #[test]
+    fn import_external_rejects_public_key_only() {
+        let original = generate(SeedWordCount::Twelve, "Alice").unwrap();
+        let public_only =
+            openpgp::serialize::SerializeInto::to_vec(&original.cert.armored()).unwrap();
+
+        let err = import_external(&public_only, None).unwrap_err();
+        assert!(err.to_string().contains("chiave privata"));
+    }
+
+    #[test]
+    fn import_external_works_without_passphrase_when_key_has_none() {
+        // export_private_key_file rifiuta una password vuota, quindi per
+        // simulare una chiave *non* protetta si costruisce direttamente
+        // un TSK senza cifrare il materiale segreto.
+        let original = generate(SeedWordCount::Twelve, "Alice").unwrap();
+        let unprotected =
+            openpgp::serialize::SerializeInto::to_vec(&original.cert.as_tsk().armored()).unwrap();
+
+        let imported = import_external(&unprotected, None).unwrap();
+        assert_eq!(imported.cert.fingerprint(), original.cert.fingerprint());
     }
 
     #[test]

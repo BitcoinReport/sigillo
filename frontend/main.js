@@ -1,13 +1,21 @@
 const { invoke } = window.__TAURI__.core;
 const { save, open } = window.__TAURI__.dialog;
-const { writeTextFile, writeFile, readFile, size } = window.__TAURI__.fs;
+const { writeTextFile, writeFile, readFile, readTextFile, size } = window.__TAURI__.fs;
 const { writeText } = window.__TAURI__.clipboardManager;
 const { getCurrentWebview } = window.__TAURI__.webview;
 const { openPath } = window.__TAURI__.opener;
 
 /** @type {{name: string, key: string, fingerprintHex: string, fingerprintWords: string[], email: string|null, phone: string|null, notes: string|null, photoBase64: string|null, photoMime: string|null}[]} */
 const contacts = [];
-let currentIdentity = null;
+
+// Tutte le identità sbloccate su questo dispositivo in questa sessione
+// (Sigillo supporta più identità/account contemporaneamente). "Attiva"
+// e' quella mostrata in "La mia identità" e usata per firmare quando
+// Scrivi non ne indica una diversa esplicitamente.
+/** @type {{displayName: string, seedPhrase: string|null, seedWords: string[], fingerprintHex: string, fingerprintWords: string[], publicKeyArmored: string, isImported: boolean}[]} */
+let identities = [];
+let activeIdentityIndex = 0;
+
 let pendingSeedWords = [];
 let currentImageFormat = "asc";
 
@@ -173,16 +181,82 @@ function setError(id, message) {
   }
 }
 
-async function renderIdentity(view) {
-  currentIdentity = view;
-  document.getElementById("my-name").textContent = view.display_name;
-  document.getElementById("my-fingerprint-words").textContent =
-    view.fingerprint_words.join("  ");
-  document.getElementById("my-public-key").value = view.public_key_armored;
+function identityFromView(view) {
+  return {
+    displayName: view.display_name,
+    seedPhrase: view.seed_phrase,
+    seedWords: view.seed_words,
+    fingerprintHex: view.fingerprint_hex,
+    fingerprintWords: view.fingerprint_words,
+    publicKeyArmored: view.public_key_armored,
+    isImported: view.is_imported,
+  };
+}
+
+function renderActiveIdentity() {
+  const id = identities[activeIdentityIndex];
+  if (!id) return;
+  document.getElementById("my-name").textContent = id.displayName;
+  document.getElementById("my-imported-hint").hidden = !id.isImported;
+  document.getElementById("my-fingerprint-words").textContent = id.fingerprintWords.join("  ");
+  document.getElementById("my-public-key").value = id.publicKeyArmored;
+}
+
+// Il selettore compare solo quando c'e' davvero una scelta da fare: con
+// una sola identita' sarebbe un menu inutile da mostrare sempre.
+function renderIdentitySwitcher() {
+  const row = document.getElementById("identity-switcher-row");
+  const select = document.getElementById("identity-switcher");
+  if (identities.length <= 1) {
+    row.hidden = true;
+    return;
+  }
+  select.innerHTML = "";
+  identities.forEach((id, i) => {
+    const opt = document.createElement("option");
+    opt.value = String(i);
+    opt.textContent = id.displayName;
+    select.appendChild(opt);
+  });
+  select.value = String(activeIdentityIndex);
+  row.hidden = false;
+}
+
+function renderSenderSelect() {
+  const row = document.getElementById("sender-select-row");
+  const select = document.getElementById("sender-select");
+  if (identities.length <= 1) {
+    row.hidden = true;
+    return;
+  }
+  select.innerHTML = "";
+  identities.forEach((id, i) => {
+    const opt = document.createElement("option");
+    opt.value = String(i);
+    opt.textContent = id.displayName;
+    select.appendChild(opt);
+  });
+  select.value = String(activeIdentityIndex);
+  row.hidden = false;
+}
+
+/**
+ * Applica l'elenco completo delle identità sul dispositivo (dopo uno
+ * sblocco, o dopo aver aggiunto/creato un'identità) e ricarica lo stato
+ * che dipende dall'avere un'identità attiva (rubrica, formato immagini).
+ */
+async function applyIdentitiesList(views, activeIdx) {
+  identities = views.map(identityFromView);
+  activeIdentityIndex = Math.min(Math.max(0, activeIdx), identities.length - 1);
+
+  renderActiveIdentity();
+  renderIdentitySwitcher();
+  renderSenderSelect();
   document.getElementById("btn-open-advanced").hidden = false;
 
-  // La rubrica è salvata sul dispositivo: la ricarichiamo ad ogni sblocco,
-  // così i contatti aggiunti in sessioni precedenti sono ancora lì.
+  // La rubrica è salvata sul dispositivo (non per singola identità): la
+  // ricarichiamo ad ogni sblocco, così i contatti aggiunti in sessioni
+  // precedenti sono ancora lì.
   contacts.length = 0;
   try {
     const saved = await invoke("load_contacts");
@@ -200,6 +274,21 @@ async function renderIdentity(view) {
     currentImageFormat = "asc";
   }
 }
+
+document.getElementById("identity-switcher").addEventListener("change", async (e) => {
+  const idx = Number(e.target.value);
+  try {
+    await invoke("set_active_identity", { index: idx });
+    activeIdentityIndex = idx;
+    renderActiveIdentity();
+    renderSenderSelect();
+  } catch (err) {
+    // Non dovrebbe mai succedere (l'indice viene sempre da questa
+    // stessa lista): se capita comunque, non lasciamo l'interfaccia in
+    // uno stato incoerente.
+    e.target.value = String(activeIdentityIndex);
+  }
+});
 
 function renderSeedGrid(words) {
   const grid = document.getElementById("seed-words");
@@ -296,7 +385,8 @@ function renderContactList() {
 }
 
 function resetAppToFirstRunState() {
-  currentIdentity = null;
+  identities = [];
+  activeIdentityIndex = 0;
   pendingSeedWords = [];
   contacts.length = 0;
   contactDetailIndex = null;
@@ -461,12 +551,44 @@ async function init() {
 
 // ---------- Schermata: ingresso ----------
 
+// La schermata di ingresso serve sia al primo avvio (nessuna identità
+// ancora) sia per aggiungere un'identità in più da "La mia identità":
+// in questo secondo caso il testo cambia leggermente e il tasto
+// indietro riporta all'app invece che essere assente.
+function showWelcomeScreen() {
+  const adding = identities.length > 0;
+  document.getElementById("btn-welcome-back").hidden = !adding;
+  document.getElementById("welcome-title").textContent = adding
+    ? "Aggiungi un'altra identità"
+    : "Benvenuto in Sigillo";
+  document.getElementById("welcome-text").textContent = adding
+    ? "Crea una nuova identità, oppure importane una esistente (con la seed phrase o con una chiave PGP generata altrove)."
+    : "Scrivi messaggi che solo il destinatario può leggere. Non serve un'email, non serve una password su un server: tutto resta su questo dispositivo.";
+  setView("screen-welcome");
+}
+
+document.getElementById("btn-welcome-back").addEventListener("click", () => {
+  document.querySelector('[data-tab="tab-identity"]').click();
+  setView("screen-main");
+});
+
 document.getElementById("btn-go-create").addEventListener("click", () => {
+  document.getElementById("display-name").value = "";
   setView("screen-create-name");
 });
 
 document.getElementById("btn-go-import").addEventListener("click", () => {
+  document.getElementById("import-display-name").value = "";
+  document.getElementById("import-phrase").value = "";
   setView("screen-import");
+});
+
+document.getElementById("btn-go-import-external").addEventListener("click", () => {
+  document.getElementById("import-external-alias").value = "";
+  document.getElementById("import-external-key").value = "";
+  document.getElementById("import-external-passphrase").value = "";
+  setError("import-external-error", null);
+  setView("screen-import-external");
 });
 
 // ---------- Schermata: sblocco ----------
@@ -475,10 +597,10 @@ document.getElementById("btn-unlock").addEventListener("click", async (e) => {
   setError("unlock-error", null);
   const passphrase = document.getElementById("unlock-passphrase").value;
   try {
-    const view = await withLoading(e.currentTarget, () =>
+    const views = await withLoading(e.currentTarget, () =>
       invoke("unlock_identity", { passphrase })
     );
-    await renderIdentity(view);
+    await applyIdentitiesList(views, 0);
     setView("screen-main");
   } catch (err) {
     setError("unlock-error", String(err));
@@ -514,7 +636,6 @@ document.getElementById("btn-generate").addEventListener("click", async (e) => {
     const view = await withLoading(e.currentTarget, () =>
       invoke("generate_identity", { wordCount, displayName })
     );
-    await renderIdentity(view);
     pendingSeedWords = view.seed_words;
     renderSeedGrid(pendingSeedWords);
     setView("screen-seed");
@@ -523,23 +644,69 @@ document.getElementById("btn-generate").addEventListener("click", async (e) => {
   }
 });
 
-// ---------- Schermata: ho già un'identità (import) ----------
+// ---------- Schermata: ho già un'identità (import da seed phrase) ----------
 
 document.getElementById("btn-import").addEventListener("click", async (e) => {
   setError("import-error", null);
   const displayName = document.getElementById("import-display-name").value;
   const phrase = document.getElementById("import-phrase").value;
   try {
-    const view = await withLoading(e.currentTarget, () =>
-      invoke("import_identity", { phrase, displayName })
-    );
-    await renderIdentity(view);
+    await withLoading(e.currentTarget, () => invoke("import_identity", { phrase, displayName }));
     // Chi reinserisce una seed phrase la conosce già: non c'è bisogno di
     // rimostrarla/confermarla, si passa direttamente a proteggere questo
     // dispositivo con una passphrase locale.
+    updateSetPassphraseScreenForMode();
     setView("screen-set-passphrase");
   } catch (err) {
     setError("import-error", String(err));
+  }
+});
+
+// ---------- Schermata: importa chiave PGP esterna ----------
+
+document.getElementById("btn-choose-external-key-file").addEventListener("click", async () => {
+  setError("import-external-error", null);
+  const path = await open({
+    multiple: false,
+    filters: [{ name: "Chiave privata OpenPGP", extensions: ["asc", "gpg", "pgp", "key", "txt"] }],
+  });
+  if (!path) return;
+  try {
+    document.getElementById("import-external-key").value = await readTextFile(path);
+  } catch (err) {
+    setError("import-external-error", String(err));
+  }
+});
+
+document.getElementById("btn-import-external").addEventListener("click", async (e) => {
+  setError("import-external-error", null);
+  const alias = document.getElementById("import-external-alias").value;
+  const armoredTsk = document.getElementById("import-external-key").value.trim();
+  const keyPassphrase = document.getElementById("import-external-passphrase").value;
+
+  if (!armoredTsk) {
+    setError("import-external-error", "Incolla o scegli il file con la chiave privata.");
+    return;
+  }
+  if (!alias.trim()) {
+    setError("import-external-error", "Scegli un nome per riconoscere questa identità.");
+    return;
+  }
+
+  try {
+    await withLoading(e.currentTarget, () =>
+      invoke("import_identity_external", {
+        armoredTsk,
+        keyPassphrase: keyPassphrase || null,
+        alias,
+      })
+    );
+    // Una chiave importata non ha una seed phrase Sigillo da
+    // confermare: si passa direttamente alla passphrase del dispositivo.
+    updateSetPassphraseScreenForMode();
+    setView("screen-set-passphrase");
+  } catch (err) {
+    setError("import-external-error", String(err));
   }
 });
 
@@ -565,6 +732,7 @@ document.getElementById("btn-confirm-check").addEventListener("click", async (e)
       invoke("confirm_seed_words", { positionsAndWords })
     );
     if (ok) {
+      updateSetPassphraseScreenForMode();
       setView("screen-set-passphrase");
     } else {
       document.getElementById("confirm-error").hidden = false;
@@ -574,28 +742,57 @@ document.getElementById("btn-confirm-check").addEventListener("click", async (e)
   }
 });
 
-// ---------- Schermata: imposta la passphrase locale ----------
+// ---------- Schermata: imposta/conferma la passphrase locale ----------
+
+// Con nessuna identita' ancora sbloccata siamo nel wizard di primo
+// avvio (bisogna sceglierne una nuova, quindi va anche ripetuta); se
+// invece ce n'e' gia' almeno una, stiamo aggiungendo un'identita' a un
+// vault che esiste gia': la passphrase e' quella che protegge gia' il
+// dispositivo, va solo confermata una volta.
+function updateSetPassphraseScreenForMode() {
+  const adding = identities.length > 0;
+  document.getElementById("set-passphrase-title").textContent = adding
+    ? "Conferma la passphrase del dispositivo"
+    : "Proteggi questo dispositivo";
+  document.getElementById("set-passphrase-text").textContent = adding
+    ? 'Questa identità verrà aggiunta alle altre già presenti su questo dispositivo. Inserisci la passphrase che usi per sbloccare Sigillo qui: dev\'essere la stessa.'
+    : "Scegli una passphrase per sbloccare Sigillo su questo computer. Non è la tua seed phrase (quella serve solo per reimportare l'identità su un altro dispositivo, o se rimuovi l'identità da qui): la passphrase resta locale.";
+  document.getElementById("set-passphrase-label").textContent = adding
+    ? "Passphrase del dispositivo"
+    : "Passphrase (almeno 8 caratteri)";
+  document.getElementById("set-passphrase").placeholder = adding
+    ? "La passphrase di questo dispositivo"
+    : "Scegli una passphrase";
+  document.getElementById("set-passphrase-confirm-row").hidden = adding;
+}
 
 document.getElementById("btn-save-passphrase").addEventListener("click", async (e) => {
   setError("set-passphrase-error", null);
   const passphrase = document.getElementById("set-passphrase").value;
-  const confirmPassphrase = document.getElementById("set-passphrase-confirm").value;
+  const adding = identities.length > 0;
 
   if (passphrase.length < 8) {
     setError("set-passphrase-error", "La passphrase deve avere almeno 8 caratteri.");
     return;
   }
-  if (passphrase !== confirmPassphrase) {
-    setError("set-passphrase-error", "Le due passphrase non coincidono.");
-    return;
+  if (!adding) {
+    const confirmPassphrase = document.getElementById("set-passphrase-confirm").value;
+    if (passphrase !== confirmPassphrase) {
+      setError("set-passphrase-error", "Le due passphrase non coincidono.");
+      return;
+    }
   }
 
   try {
-    await withLoading(e.currentTarget, () =>
+    const views = await withLoading(e.currentTarget, () =>
       invoke("save_identity_to_disk", { passphrase })
     );
     document.getElementById("set-passphrase").value = "";
     document.getElementById("set-passphrase-confirm").value = "";
+    await applyIdentitiesList(views, views.length - 1);
+    if (adding) {
+      document.querySelector('[data-tab="tab-identity"]').click();
+    }
     setView("screen-main");
   } catch (err) {
     setError("set-passphrase-error", String(err));
@@ -787,6 +984,10 @@ document.getElementById("btn-encrypt").addEventListener("click", async (e) => {
     .map((el) => contacts[Number(el.value)].key);
   const plaintext = document.getElementById("message-text").value;
   const sign = document.getElementById("sign-message").checked;
+  // Con una sola identita' il selettore e' nascosto: si usa sempre
+  // quella attiva (undefined -> il backend ripiega da solo su di essa).
+  const senderIndex =
+    identities.length > 1 ? Number(document.getElementById("sender-select").value) : undefined;
 
   if (selected.length === 0) {
     setError("encrypt-error", "Seleziona almeno un destinatario.");
@@ -819,6 +1020,7 @@ document.getElementById("btn-encrypt").addEventListener("click", async (e) => {
             sourcePath: attachedImagePath,
             outputPath,
             sign,
+            senderIndex,
           });
           document.getElementById("encrypt-image-result-label").textContent =
             "Messaggio cifrato salvato:";
@@ -832,6 +1034,7 @@ document.getElementById("btn-encrypt").addEventListener("click", async (e) => {
           recipientsArmored: selected,
           plaintext,
           sign,
+          senderIndex,
         });
         document.getElementById("ciphertext-out").value = ciphertext;
         document.getElementById("encrypt-result").hidden = false;
@@ -849,6 +1052,7 @@ document.getElementById("btn-encrypt").addEventListener("click", async (e) => {
             sourcePath: attachedImagePath,
             outputPath,
             sign,
+            senderIndex,
           });
           document.getElementById("encrypt-image-result-label").textContent =
             "File cifrato salvato:";
@@ -1072,6 +1276,10 @@ document.getElementById("btn-copy-pubkey").addEventListener("click", async () =>
   await writeText(document.getElementById("my-public-key").value);
 });
 
+document.getElementById("btn-add-another-identity").addEventListener("click", () => {
+  showWelcomeScreen();
+});
+
 // ---------- Avanzate ----------
 
 function formatUnixDate(unixSeconds) {
@@ -1104,7 +1312,7 @@ function renderTechDetail(container, detail) {
 
 async function populateAdvancedScreen() {
   document.getElementById("adv-my-fingerprint-hex").textContent =
-    currentIdentity ? currentIdentity.fingerprint_hex : "";
+    identities[activeIdentityIndex] ? identities[activeIdentityIndex].fingerprintHex : "";
 
   const myDetails = document.getElementById("adv-my-details");
   myDetails.innerHTML = "";

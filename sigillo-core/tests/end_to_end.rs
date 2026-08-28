@@ -314,7 +314,7 @@ fn reimported_identity_can_still_decrypt_old_messages() {
 
     // Simula: Alice reinstalla Sigillo su un altro dispositivo e reinserisce
     // la stessa seed phrase.
-    let alice_again = identity::import(&alice.seed_phrase(), "Alice").unwrap();
+    let alice_again = identity::import(&alice.seed_phrase().unwrap(), "Alice").unwrap();
     assert_eq!(alice.cert.fingerprint(), alice_again.cert.fingerprint());
 
     let decrypted = message::decrypt(&alice_again.cert, &[], &ciphertext).unwrap();

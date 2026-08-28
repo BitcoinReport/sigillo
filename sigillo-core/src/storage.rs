@@ -1,15 +1,24 @@
-//! Salvataggio cifrato a riposo dell'identità sul dispositivo.
+//! Salvataggio cifrato a riposo delle identità sul dispositivo.
 //!
-//! Il file salvato su disco non contiene mai la seed phrase (o la chiave
-//! privata) in chiaro: è sempre cifrato con una chiave derivata dalla
+//! Il file salvato su disco non contiene mai una seed phrase o una chiave
+//! privata in chiaro: è sempre cifrato con una chiave derivata dalla
 //! passphrase locale scelta dall'utente, tramite Argon2id (resistente ad
 //! attacchi a forza bruta) + AES-256-GCM (cifratura autenticata: un file
 //! manomesso o una passphrase sbagliata vengono rilevati, non decifrati
 //! per errore).
 //!
-//! Questa passphrase locale è diversa dalla seed phrase: sblocca solo
-//! l'identità già salvata su *questo* dispositivo, non permette di
-//! rigenerarla altrove (per quello serve la seed phrase).
+//! Questa passphrase locale è diversa dalla seed phrase (o dalla eventuale
+//! passphrase originale di una chiave importata): sblocca solo le identità
+//! già salvate su *questo* dispositivo.
+//!
+//! Dalla versione con supporto multi-account, il vault può contenere più
+//! identità contemporaneamente, sbloccate tutte con un'unica passphrase di
+//! dispositivo (per non costringere l'utente a ricordarne una diversa per
+//! ciascuna), ma cifrate ciascuna separatamente: ogni voce ha il proprio
+//! nonce e la propria autenticazione AEAD, così un problema su una voce
+//! non intacca le altre. Il formato precedente (una sola identità) resta
+//! leggibile: viene riconosciuto dal suo marcatore e caricato come un
+//! vault con un'unica voce.
 
 use std::fs;
 use std::io::Write;
@@ -22,7 +31,8 @@ use argon2::{Algorithm, Argon2, Params, Version};
 use rand::RngCore;
 use zeroize::Zeroizing;
 
-const MAGIC: &[u8; 4] = b"SGL1";
+const MAGIC_V1: &[u8; 4] = b"SGL1";
+const MAGIC_V2: &[u8; 4] = b"SGL2";
 const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 12;
 
@@ -33,13 +43,36 @@ const ARGON2_M_COST: u32 = 19_456;
 const ARGON2_T_COST: u32 = 2;
 const ARGON2_P_COST: u32 = 1;
 
-/// Vero se esiste già un'identità salvata su questo dispositivo in `path`.
+/// Da dove viene il materiale segreto di un'identità nel vault.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EntrySource {
+    /// Identità generata o reimportata da Sigillo tramite seed phrase BIP39.
+    Seed(String),
+    /// Identità importata da una chiave OpenPGP generata altrove (GPG
+    /// Suite, Kleopatra, terminale...): il testo è la chiave privata
+    /// completa in formato ASCII armored, con il materiale segreto già
+    /// in chiaro (l'eventuale passphrase originale della chiave serve
+    /// solo al momento dell'import, non per le letture successive).
+    ImportedTsk(String),
+}
+
+/// Una identità così come persiste nel vault: un nome scelto
+/// dall'utente per riconoscerla nell'interfaccia, più il materiale da
+/// cui ricostruirla.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VaultEntry {
+    pub alias: String,
+    pub source: EntrySource,
+}
+
+/// Vero se su questo dispositivo esiste già un vault (uno o più
+/// identità) in `path`.
 pub fn vault_exists(path: &Path) -> bool {
     path.is_file()
 }
 
-fn derive_key(passphrase: &str, salt: &[u8]) -> Result<Zeroizing<[u8; 32]>> {
-    let params = Params::new(ARGON2_M_COST, ARGON2_T_COST, ARGON2_P_COST, Some(32))
+fn derive_key(passphrase: &str, salt: &[u8], m_cost: u32, t_cost: u32, p_cost: u32) -> Result<Zeroizing<[u8; 32]>> {
+    let params = Params::new(m_cost, t_cost, p_cost, Some(32))
         .map_err(|e| anyhow::anyhow!("parametri Argon2 non validi: {e}"))?;
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
 
@@ -50,56 +83,75 @@ fn derive_key(passphrase: &str, salt: &[u8]) -> Result<Zeroizing<[u8; 32]>> {
     Ok(key)
 }
 
-fn encode_payload(display_name: &str, seed_phrase: &str) -> Zeroizing<Vec<u8>> {
-    let mut payload = Zeroizing::new(Vec::new());
-    let name_bytes = display_name.as_bytes();
-    let phrase_bytes = seed_phrase.as_bytes();
+// ---------- Codifica di una singola voce (prima della cifratura) ----------
 
-    payload.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
-    payload.extend_from_slice(name_bytes);
-    payload.extend_from_slice(&(phrase_bytes.len() as u16).to_le_bytes());
-    payload.extend_from_slice(phrase_bytes);
-    payload
+fn read_u8(data: &[u8], pos: &mut usize) -> Result<u8> {
+    Ok(read_bytes(data, pos, 1)?[0])
 }
 
-fn decode_payload(payload: &[u8]) -> Result<(String, String)> {
-    if payload.len() < 2 {
-        bail!("file dell'identità corrotto");
-    }
-    let name_len = u16::from_le_bytes([payload[0], payload[1]]) as usize;
-    let name_start = 2;
-    let name_end = name_start + name_len;
-    if payload.len() < name_end + 2 {
-        bail!("file dell'identità corrotto");
-    }
-    let display_name = String::from_utf8(payload[name_start..name_end].to_vec())
-        .context("file dell'identità corrotto (nome non valido)")?;
-
-    let phrase_len_start = name_end;
-    let phrase_len =
-        u16::from_le_bytes([payload[phrase_len_start], payload[phrase_len_start + 1]]) as usize;
-    let phrase_start = phrase_len_start + 2;
-    let phrase_end = phrase_start + phrase_len;
-    if payload.len() != phrase_end {
-        bail!("file dell'identità corrotto");
-    }
-    let seed_phrase = String::from_utf8(payload[phrase_start..phrase_end].to_vec())
-        .context("file dell'identità corrotto (seed phrase non valida)")?;
-
-    Ok((display_name, seed_phrase))
+fn read_u16(data: &[u8], pos: &mut usize) -> Result<u16> {
+    Ok(u16::from_le_bytes(read_bytes(data, pos, 2)?.try_into().unwrap()))
 }
 
-/// Cifra e salva l'identità (nome visualizzato + seed phrase) in `path`,
-/// protetta dalla `passphrase` locale scelta dall'utente. Sovrascrive un
-/// eventuale file precedente.
-pub fn save_identity(
-    path: &Path,
-    passphrase: &str,
-    display_name: &str,
-    seed_phrase: &str,
-) -> Result<()> {
+fn read_u32(data: &[u8], pos: &mut usize) -> Result<u32> {
+    Ok(u32::from_le_bytes(read_bytes(data, pos, 4)?.try_into().unwrap()))
+}
+
+fn read_bytes<'a>(data: &'a [u8], pos: &mut usize, len: usize) -> Result<&'a [u8]> {
+    let end = pos.checked_add(len).context("file dell'identità corrotto")?;
+    let slice = data.get(*pos..end).context("file dell'identità corrotto")?;
+    *pos = end;
+    Ok(slice)
+}
+
+fn encode_entry(entry: &VaultEntry) -> Vec<u8> {
+    let alias_bytes = entry.alias.as_bytes();
+    let (kind, secret): (u8, &str) = match &entry.source {
+        EntrySource::Seed(phrase) => (0, phrase.as_str()),
+        EntrySource::ImportedTsk(armored) => (1, armored.as_str()),
+    };
+    let secret_bytes = secret.as_bytes();
+
+    let mut out = Vec::with_capacity(2 + alias_bytes.len() + 1 + 4 + secret_bytes.len());
+    out.extend_from_slice(&(alias_bytes.len() as u16).to_le_bytes());
+    out.extend_from_slice(alias_bytes);
+    out.push(kind);
+    out.extend_from_slice(&(secret_bytes.len() as u32).to_le_bytes());
+    out.extend_from_slice(secret_bytes);
+    out
+}
+
+fn decode_entry(data: &[u8]) -> Result<VaultEntry> {
+    let mut pos = 0;
+    let alias_len = read_u16(data, &mut pos)? as usize;
+    let alias = String::from_utf8(read_bytes(data, &mut pos, alias_len)?.to_vec())
+        .context("file dell'identità corrotto (alias non valido)")?;
+    let kind = read_u8(data, &mut pos)?;
+    let secret_len = read_u32(data, &mut pos)? as usize;
+    let secret = String::from_utf8(read_bytes(data, &mut pos, secret_len)?.to_vec())
+        .context("file dell'identità corrotto (materiale non valido)")?;
+
+    let source = match kind {
+        0 => EntrySource::Seed(secret),
+        1 => EntrySource::ImportedTsk(secret),
+        _ => bail!("file dell'identità corrotto (tipo di identità sconosciuto)"),
+    };
+    Ok(VaultEntry { alias, source })
+}
+
+// ---------- Formato V2 (multi-identità) ----------
+
+/// Cifra e salva tutte le `entries` in `path`, protette dalla
+/// `passphrase` locale scelta dall'utente. Sovrascrive un eventuale
+/// vault precedente (in qualunque formato fosse). Ogni voce viene
+/// cifrata separatamente (nonce e autenticazione propri), pur
+/// derivando tutte dalla stessa passphrase.
+pub fn save_vault(path: &Path, passphrase: &str, entries: &[VaultEntry]) -> Result<()> {
     if passphrase.is_empty() {
         bail!("la passphrase non può essere vuota");
+    }
+    if entries.is_empty() {
+        bail!("il vault deve contenere almeno un'identità");
     }
 
     if let Some(parent) = path.parent() {
@@ -108,27 +160,32 @@ pub fn save_identity(
 
     let mut salt = [0u8; SALT_LEN];
     rand::rngs::OsRng.fill_bytes(&mut salt);
-    let mut nonce_bytes = [0u8; NONCE_LEN];
-    rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
-
-    let key = derive_key(passphrase, &salt)?;
+    let key = derive_key(passphrase, &salt, ARGON2_M_COST, ARGON2_T_COST, ARGON2_P_COST)?;
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key.as_slice()));
-    let nonce = Nonce::from_slice(&nonce_bytes);
 
-    let payload = encode_payload(display_name, seed_phrase);
-    let ciphertext = cipher
-        .encrypt(nonce, payload.as_slice())
-        .map_err(|_| anyhow::anyhow!("cifratura dell'identità fallita"))?;
-
-    let mut out = Vec::with_capacity(4 + 1 + SALT_LEN + 12 + NONCE_LEN + ciphertext.len());
-    out.extend_from_slice(MAGIC);
+    let mut out = Vec::new();
+    out.extend_from_slice(MAGIC_V2);
     out.push(SALT_LEN as u8);
     out.extend_from_slice(&salt);
     out.extend_from_slice(&ARGON2_M_COST.to_le_bytes());
     out.extend_from_slice(&ARGON2_T_COST.to_le_bytes());
     out.extend_from_slice(&ARGON2_P_COST.to_le_bytes());
-    out.extend_from_slice(&nonce_bytes);
-    out.extend_from_slice(&ciphertext);
+    out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+
+    for entry in entries {
+        let mut nonce_bytes = [0u8; NONCE_LEN];
+        rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
+        let nonce = Nonce::from_slice(&nonce_bytes);
+
+        let payload = encode_entry(entry);
+        let ciphertext = cipher
+            .encrypt(nonce, payload.as_slice())
+            .map_err(|_| anyhow::anyhow!("cifratura di un'identità fallita"))?;
+
+        out.extend_from_slice(&nonce_bytes);
+        out.extend_from_slice(&(ciphertext.len() as u32).to_le_bytes());
+        out.extend_from_slice(&ciphertext);
+    }
 
     // File temporaneo + rename atomico, così un crash a meta scrittura non
     // lascia un vault troncato/corrotto al posto di quello precedente.
@@ -143,58 +200,96 @@ pub fn save_identity(
     Ok(())
 }
 
-/// Decifra l'identità salvata in `path` con la `passphrase` fornita.
-/// Restituisce `(nome_visualizzato, seed_phrase)`.
-pub fn load_identity(path: &Path, passphrase: &str) -> Result<(String, String)> {
-    let data = fs::read(path).context("nessuna identità salvata su questo dispositivo")?;
+fn load_vault_v2(data: &[u8], passphrase: &str) -> Result<Vec<VaultEntry>> {
+    let mut pos = 4; // magic gia' controllato dal chiamante
 
-    if data.len() < 4 || &data[0..4] != MAGIC {
-        bail!("il file dell'identità non è valido o è di una versione non supportata");
+    let salt_len = read_u8(data, &mut pos)? as usize;
+    let salt = read_bytes(data, &mut pos, salt_len)?;
+    let m_cost = read_u32(data, &mut pos)?;
+    let t_cost = read_u32(data, &mut pos)?;
+    let p_cost = read_u32(data, &mut pos)?;
+    let entry_count = read_u16(data, &mut pos)? as usize;
+
+    let key = derive_key(passphrase, salt, m_cost, t_cost, p_cost)?;
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key.as_slice()));
+
+    let mut entries = Vec::with_capacity(entry_count);
+    for _ in 0..entry_count {
+        let nonce_bytes = read_bytes(data, &mut pos, NONCE_LEN)?;
+        let nonce = Nonce::from_slice(nonce_bytes);
+        let ciphertext_len = read_u32(data, &mut pos)? as usize;
+        let ciphertext = read_bytes(data, &mut pos, ciphertext_len)?;
+
+        let payload = cipher
+            .decrypt(nonce, ciphertext)
+            .map_err(|_| anyhow::anyhow!("passphrase errata"))?;
+        entries.push(decode_entry(&payload)?);
     }
-    let mut offset = 4;
 
-    let salt_len = *data.get(offset).context("file dell'identità corrotto")? as usize;
-    offset += 1;
-    if data.len() < offset + salt_len + 12 + NONCE_LEN {
-        bail!("file dell'identità corrotto");
-    }
-    let salt = &data[offset..offset + salt_len];
-    offset += salt_len;
+    Ok(entries)
+}
 
-    let m_cost = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
-    offset += 4;
-    let t_cost = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
-    offset += 4;
-    let p_cost = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
-    offset += 4;
+// ---------- Formato V1 (retrocompatibilità: una sola identità) ----------
 
-    let nonce_bytes = &data[offset..offset + NONCE_LEN];
-    offset += NONCE_LEN;
+fn decode_payload_v1(payload: &[u8]) -> Result<(String, String)> {
+    let mut pos = 0;
+    let name_len = read_u16(payload, &mut pos)? as usize;
+    let display_name = String::from_utf8(read_bytes(payload, &mut pos, name_len)?.to_vec())
+        .context("file dell'identità corrotto (nome non valido)")?;
+    let phrase_len = read_u16(payload, &mut pos)? as usize;
+    let seed_phrase = String::from_utf8(read_bytes(payload, &mut pos, phrase_len)?.to_vec())
+        .context("file dell'identità corrotto (seed phrase non valida)")?;
+    Ok((display_name, seed_phrase))
+}
 
-    let ciphertext = &data[offset..];
+fn load_vault_v1(data: &[u8], passphrase: &str) -> Result<Vec<VaultEntry>> {
+    let mut pos = 4; // magic gia' controllato dal chiamante
 
-    let params = Params::new(m_cost, t_cost, p_cost, Some(32))
-        .map_err(|e| anyhow::anyhow!("parametri Argon2 non validi nel file: {e}"))?;
-    let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
-    let mut key = Zeroizing::new([0u8; 32]);
-    argon2
-        .hash_password_into(passphrase.as_bytes(), salt, key.as_mut_slice())
-        .map_err(|e| anyhow::anyhow!("derivazione della chiave fallita: {e}"))?;
+    let salt_len = read_u8(data, &mut pos)? as usize;
+    let salt = read_bytes(data, &mut pos, salt_len)?;
+    let m_cost = read_u32(data, &mut pos)?;
+    let t_cost = read_u32(data, &mut pos)?;
+    let p_cost = read_u32(data, &mut pos)?;
+    let nonce_bytes = read_bytes(data, &mut pos, NONCE_LEN)?;
+    let ciphertext = &data[pos..];
 
+    let key = derive_key(passphrase, salt, m_cost, t_cost, p_cost)?;
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key.as_slice()));
     let nonce = Nonce::from_slice(nonce_bytes);
 
     let payload = cipher
         .decrypt(nonce, ciphertext)
         .map_err(|_| anyhow::anyhow!("passphrase errata"))?;
+    let (display_name, seed_phrase) = decode_payload_v1(&payload)?;
 
-    decode_payload(&payload)
+    Ok(vec![VaultEntry {
+        alias: display_name,
+        source: EntrySource::Seed(seed_phrase),
+    }])
 }
 
-/// Cancella in modo sicuro l'identità salvata su questo dispositivo:
-/// sovrascrive il file con zeri prima di rimuoverlo, così anche un
-/// recupero grezzo dal disco non ritroverebbe la seed phrase cifrata.
-/// Dopo questa chiamata `vault_exists` torna a restituire `false`.
+/// Decifra tutte le identità salvate in `path` con la `passphrase`
+/// fornita, riconoscendo automaticamente sia il formato attuale
+/// (multi-identità) sia quello precedente (una sola identità, ancora
+/// perfettamente leggibile). Il risultato ha sempre almeno una voce.
+pub fn load_vault(path: &Path, passphrase: &str) -> Result<Vec<VaultEntry>> {
+    let data = fs::read(path).context("nessuna identità salvata su questo dispositivo")?;
+    if data.len() < 4 {
+        bail!("il file dell'identità non è valido o è di una versione non supportata");
+    }
+    let magic: &[u8; 4] = data[0..4].try_into().unwrap();
+    match magic {
+        m if m == MAGIC_V1 => load_vault_v1(&data, passphrase),
+        m if m == MAGIC_V2 => load_vault_v2(&data, passphrase),
+        _ => bail!("il file dell'identità non è valido o è di una versione non supportata"),
+    }
+}
+
+/// Cancella in modo sicuro il vault salvato su questo dispositivo (tutte
+/// le identità che contiene): sovrascrive il file con zeri prima di
+/// rimuoverlo, così anche un recupero grezzo dal disco non ritroverebbe
+/// il materiale segreto cifrato. Dopo questa chiamata `vault_exists`
+/// torna a restituire `false`.
 pub fn remove_identity(path: &Path) -> Result<()> {
     if !path.exists() {
         return Ok(());
@@ -216,17 +311,48 @@ pub fn remove_identity(path: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
+    fn seed_entry(alias: &str, phrase: &str) -> VaultEntry {
+        VaultEntry {
+            alias: alias.to_string(),
+            source: EntrySource::Seed(phrase.to_string()),
+        }
+    }
+
     #[test]
-    fn save_then_load_round_trip() {
+    fn save_then_load_round_trip_single_entry() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("identity.sigillo");
 
-        save_identity(&path, "passphrase-di-prova", "Alice", "parola1 parola2 parola3").unwrap();
+        save_vault(&path, "passphrase-di-prova", &[seed_entry("Alice", "parola1 parola2 parola3")]).unwrap();
         assert!(vault_exists(&path));
 
-        let (name, phrase) = load_identity(&path, "passphrase-di-prova").unwrap();
-        assert_eq!(name, "Alice");
-        assert_eq!(phrase, "parola1 parola2 parola3");
+        let entries = load_vault(&path, "passphrase-di-prova").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].alias, "Alice");
+        assert_eq!(entries[0].source, EntrySource::Seed("parola1 parola2 parola3".to_string()));
+    }
+
+    #[test]
+    fn save_then_load_round_trip_multiple_entries_mixed_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity.sigillo");
+
+        let entries = vec![
+            seed_entry("Alice personale", "una due tre"),
+            VaultEntry {
+                alias: "Alice lavoro (importata)".to_string(),
+                source: EntrySource::ImportedTsk(
+                    "-----BEGIN PGP PRIVATE KEY BLOCK-----\nfake\n-----END PGP PRIVATE KEY BLOCK-----"
+                        .to_string(),
+                ),
+            },
+        ];
+        save_vault(&path, "passphrase-dispositivo", &entries).unwrap();
+
+        let loaded = load_vault(&path, "passphrase-dispositivo").unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0], entries[0]);
+        assert_eq!(loaded[1], entries[1]);
     }
 
     #[test]
@@ -234,8 +360,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("identity.sigillo");
 
-        save_identity(&path, "passphrase-corretta", "Alice", "seed phrase segreta").unwrap();
-        let err = load_identity(&path, "passphrase-sbagliata").unwrap_err();
+        save_vault(&path, "passphrase-corretta", &[seed_entry("Alice", "seed phrase segreta")]).unwrap();
+        let err = load_vault(&path, "passphrase-sbagliata").unwrap_err();
         assert!(err.to_string().contains("passphrase errata"));
     }
 
@@ -245,11 +371,9 @@ mod tests {
         let path = dir.path().join("identity.sigillo");
         let seed_phrase = "abbandonare abbaglio abbastanza zibetto zoccolo zoppo";
 
-        save_identity(&path, "una passphrase robusta", "Bob", seed_phrase).unwrap();
+        save_vault(&path, "una passphrase robusta", &[seed_entry("Bob", seed_phrase)]).unwrap();
 
         let raw = fs::read(&path).unwrap();
-        // Nessuna delle parole della seed phrase deve comparire in chiaro
-        // da nessuna parte nel file salvato su disco.
         for word in seed_phrase.split_whitespace() {
             assert!(
                 !raw.windows(word.len()).any(|w| w == word.as_bytes()),
@@ -263,7 +387,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("identity.sigillo");
 
-        save_identity(&path, "passphrase", "Alice", "seed phrase").unwrap();
+        save_vault(&path, "passphrase", &[seed_entry("Alice", "seed phrase")]).unwrap();
         assert!(vault_exists(&path));
 
         remove_identity(&path).unwrap();
@@ -283,7 +407,55 @@ mod tests {
         let path = dir.path().join("identity.sigillo");
         fs::write(&path, b"non sono un vault Sigillo").unwrap();
 
-        let err = load_identity(&path, "qualunque").unwrap_err();
+        let err = load_vault(&path, "qualunque").unwrap_err();
         assert!(err.to_string().contains("non è valido"));
+    }
+
+    #[test]
+    fn a_vault_saved_before_multi_account_support_is_still_readable() {
+        // Ricostruisce a mano un vault nel formato V1 (una sola identità,
+        // come lo scriveva l'app prima del supporto multi-account) e
+        // verifica che load_vault lo riconosca e lo legga correttamente,
+        // senza che l'utente perda l'accesso alla propria identità dopo
+        // un aggiornamento dell'app.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity.sigillo");
+
+        let passphrase = "passphrase-prima-del-multi-account";
+        let display_name = "Alice";
+        let seed_phrase = "parola1 parola2 parola3";
+
+        let mut salt = [0u8; SALT_LEN];
+        rand::rngs::OsRng.fill_bytes(&mut salt);
+        let mut nonce_bytes = [0u8; NONCE_LEN];
+        rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
+        let key = derive_key(passphrase, &salt, ARGON2_M_COST, ARGON2_T_COST, ARGON2_P_COST).unwrap();
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key.as_slice()));
+        let nonce = Nonce::from_slice(&nonce_bytes);
+
+        let mut payload = Vec::new();
+        let name_bytes = display_name.as_bytes();
+        let phrase_bytes = seed_phrase.as_bytes();
+        payload.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+        payload.extend_from_slice(name_bytes);
+        payload.extend_from_slice(&(phrase_bytes.len() as u16).to_le_bytes());
+        payload.extend_from_slice(phrase_bytes);
+        let ciphertext = cipher.encrypt(nonce, payload.as_slice()).unwrap();
+
+        let mut out = Vec::new();
+        out.extend_from_slice(MAGIC_V1);
+        out.push(SALT_LEN as u8);
+        out.extend_from_slice(&salt);
+        out.extend_from_slice(&ARGON2_M_COST.to_le_bytes());
+        out.extend_from_slice(&ARGON2_T_COST.to_le_bytes());
+        out.extend_from_slice(&ARGON2_P_COST.to_le_bytes());
+        out.extend_from_slice(&nonce_bytes);
+        out.extend_from_slice(&ciphertext);
+        fs::write(&path, &out).unwrap();
+
+        let entries = load_vault(&path, passphrase).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].alias, "Alice");
+        assert_eq!(entries[0].source, EntrySource::Seed("parola1 parola2 parola3".to_string()));
     }
 }

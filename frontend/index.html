@@ -53,11 +53,12 @@
       </div>
     </section>
 
-    <!-- ============ SCHERMATA: ingresso (nessuna identità) ============ -->
+    <!-- ============ SCHERMATA: ingresso (nessuna identità, o "aggiungi identità") ============ -->
     <section id="screen-welcome" class="screen">
       <div class="card">
-        <h2>Benvenuto in Sigillo</h2>
-        <p>
+        <button id="btn-welcome-back" class="link-back" hidden>← Torna a "La mia identità"</button>
+        <h2 id="welcome-title">Benvenuto in Sigillo</h2>
+        <p id="welcome-text">
           Scrivi messaggi che solo il destinatario può leggere. Non serve
           un'email, non serve una password su un server: tutto resta su
           questo dispositivo.
@@ -66,6 +67,7 @@
         <div class="button-row stacked">
           <button id="btn-go-create" class="primary">Crea una nuova identità</button>
           <button id="btn-go-import" class="secondary">Ho già un'identità</button>
+          <button id="btn-go-import-external" class="secondary">Importa una chiave PGP...</button>
         </div>
       </div>
     </section>
@@ -113,6 +115,38 @@
       </div>
     </section>
 
+    <!-- ============ SCHERMATA: importa chiave PGP esterna ============ -->
+    <section id="screen-import-external" class="screen">
+      <div class="card">
+        <button class="link-back" data-back-to="screen-welcome">← Indietro</button>
+        <h2>Importa una chiave PGP</h2>
+        <p>
+          Importa una chiave privata OpenPGP generata con un altro
+          programma (GPG Suite, Kleopatra, o da terminale con GnuPG),
+          in formato ASCII armored (un file .asc, o testo che inizia
+          con "-----BEGIN PGP PRIVATE KEY BLOCK-----").
+        </p>
+
+        <label for="import-external-alias">Come vuoi chiamarla in Sigillo?</label>
+        <input id="import-external-alias" type="text" placeholder="Es. Michele (lavoro)" />
+
+        <label for="import-external-key">Chiave privata</label>
+        <textarea id="import-external-key" rows="8" placeholder="-----BEGIN PGP PRIVATE KEY BLOCK-----..."></textarea>
+        <div class="button-row">
+          <button id="btn-choose-external-key-file" class="secondary" type="button">Scegli file...</button>
+        </div>
+
+        <label for="import-external-passphrase">Passphrase della chiave (se ne ha una)</label>
+        <input id="import-external-passphrase" type="password" placeholder="Lascia vuoto se la chiave non ne ha una" />
+
+        <div class="button-row">
+          <button id="btn-import-external" class="primary">Importa chiave</button>
+        </div>
+
+        <p id="import-external-error" class="error" hidden></p>
+      </div>
+    </section>
+
     <!-- ============ SCHERMATA 2: conferma seed phrase ============ -->
     <section id="screen-seed" class="screen">
       <div class="card">
@@ -142,11 +176,11 @@
       </div>
     </section>
 
-    <!-- ============ SCHERMATA: imposta la passphrase locale ============ -->
+    <!-- ============ SCHERMATA: imposta/conferma la passphrase locale ============ -->
     <section id="screen-set-passphrase" class="screen">
       <div class="card">
-        <h2>Proteggi questo dispositivo</h2>
-        <p>
+        <h2 id="set-passphrase-title">Proteggi questo dispositivo</h2>
+        <p id="set-passphrase-text">
           Scegli una passphrase per sbloccare Sigillo su <em>questo</em>
           computer. Non è la tua seed phrase (quella serve solo per
           reimportare l'identità su un altro dispositivo, o se rimuovi
@@ -154,11 +188,13 @@
           cambiare quando vuoi rimuovendo e reimportando l'identità.
         </p>
 
-        <label for="set-passphrase">Passphrase (almeno 8 caratteri)</label>
+        <label for="set-passphrase" id="set-passphrase-label">Passphrase (almeno 8 caratteri)</label>
         <input id="set-passphrase" type="password" placeholder="Scegli una passphrase" />
 
-        <label for="set-passphrase-confirm">Ripeti la passphrase</label>
-        <input id="set-passphrase-confirm" type="password" placeholder="Ripeti la passphrase" />
+        <div id="set-passphrase-confirm-row">
+          <label for="set-passphrase-confirm">Ripeti la passphrase</label>
+          <input id="set-passphrase-confirm" type="password" placeholder="Ripeti la passphrase" />
+        </div>
 
         <div class="button-row">
           <button id="btn-save-passphrase" class="primary">Salva e continua</button>
@@ -208,6 +244,11 @@
               <p id="image-preview-name" class="hint"></p>
               <button id="btn-remove-image" class="secondary" type="button">Rimuovi file</button>
             </div>
+          </div>
+
+          <div id="sender-select-row" hidden>
+            <label for="sender-select">Firma come</label>
+            <select id="sender-select"></select>
           </div>
 
           <label class="checkbox-row">
@@ -378,7 +419,14 @@
       <div id="tab-identity" class="tab-panel">
         <div class="card">
           <h2>La mia identità</h2>
+
+          <div id="identity-switcher-row" hidden>
+            <label for="identity-switcher">Identità attiva su questo dispositivo</label>
+            <select id="identity-switcher"></select>
+          </div>
+
           <p><strong>Nome:</strong> <span id="my-name"></span></p>
+          <p id="my-imported-hint" class="hint" hidden>Importata da una chiave esterna (non ha una seed phrase Sigillo).</p>
 
           <label>Impronta (fingerprint) — leggila a voce a un contatto per verificarla</label>
           <p id="my-fingerprint-words" class="fingerprint-words"></p>
@@ -387,6 +435,11 @@
           <textarea id="my-public-key" rows="10" readonly></textarea>
           <div class="button-row">
             <button id="btn-copy-pubkey" class="secondary">Copia</button>
+          </div>
+
+          <hr />
+          <div class="button-row">
+            <button id="btn-add-another-identity" class="secondary">+ Aggiungi un'altra identità</button>
           </div>
         </div>
       </div>

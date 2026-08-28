@@ -3,6 +3,7 @@ use std::sync::Mutex;
 
 use base64::Engine;
 use serde::Serialize;
+use sequoia_openpgp::Cert;
 use tauri::{AppHandle, Manager, State};
 
 use sigillo_core::{contacts, identity, keyinfo, message, settings, storage};
@@ -12,10 +13,79 @@ const CONTACTS_FILE_NAME: &str = "contacts.json";
 const SETTINGS_FILE_NAME: &str = "settings.json";
 const MIN_PASSPHRASE_LEN: usize = 8;
 
+/// Una delle identità dell'utente, sbloccate e pronte all'uso in questa
+/// sessione: il nome/alias scelto in Sigillo (distinto dallo User ID
+/// dentro il certificato OpenPGP, specialmente per una chiave importata)
+/// più l'identità vera e propria.
+struct LoadedIdentity {
+    alias: String,
+    identity: identity::Identity,
+}
+
+/// Sigillo supporta più identità sullo stesso dispositivo, tutte
+/// protette da un'unica passphrase locale (per non costringere
+/// l'utente a ricordarne una diversa per ciascuna), ma cifrate
+/// ciascuna separatamente nel vault (vedi `storage::save_vault`).
 #[derive(Default)]
 struct AppState {
-    identity: Mutex<Option<identity::Identity>>,
-    display_name: Mutex<Option<String>>,
+    /// Tutte le identità sbloccate in questa sessione (dal vault, con
+    /// `unlock_identity`).
+    identities: Mutex<Vec<LoadedIdentity>>,
+    /// Quale, fra `identities`, è quella attiva di default (mostrata in
+    /// "La mia identità", usata per firmare se lo Scrivi non ne indica
+    /// una diversa esplicitamente).
+    active_index: Mutex<Option<usize>>,
+    /// Un'identità appena generata o importata, in attesa che l'utente
+    /// completi il wizard (conferma seed phrase se presente, poi
+    /// passphrase del dispositivo) prima di essere aggiunta al vault.
+    pending: Mutex<Option<LoadedIdentity>>,
+}
+
+/// L'identità "attiva" di default: quella mostrata in "La mia identità"
+/// e usata per firmare quando lo Scrivi non ne specifica una diversa.
+fn active_identity(state: &State<AppState>) -> Result<(String, identity::Identity), String> {
+    let identities = state.identities.lock().unwrap();
+    let idx = state
+        .active_index
+        .lock()
+        .unwrap()
+        .ok_or("genera o importa prima la tua identità")?;
+    identities
+        .get(idx)
+        .map(|li| (li.alias.clone(), clone_identity(&li.identity)))
+        .ok_or_else(|| "genera o importa prima la tua identità".to_string())
+}
+
+/// L'identità scelta da un selettore esplicito (es. il menu "Firma
+/// come..." in Scrivi), oppure quella attiva se non ne è stata indicata
+/// una specifica.
+fn identity_by_index_or_active(
+    state: &State<AppState>,
+    index: Option<usize>,
+) -> Result<identity::Identity, String> {
+    match index {
+        Some(idx) => {
+            let identities = state.identities.lock().unwrap();
+            identities
+                .get(idx)
+                .map(|li| clone_identity(&li.identity))
+                .ok_or_else(|| "identità non valida".to_string())
+        }
+        None => active_identity(state).map(|(_, id)| id),
+    }
+}
+
+/// `identity::Identity` non implementa `Clone` (contiene materiale
+/// segreto: meglio non renderlo clonabile per distrazione in giro per
+/// il codice), ma qui serve poter usare un'identità senza tenere il
+/// lock del Mutex per tutta la durata di un'operazione di
+/// cifratura/decifratura potenzialmente lunga. La clonazione è
+/// esplicita e locale a questo modulo.
+fn clone_identity(id: &identity::Identity) -> identity::Identity {
+    identity::Identity {
+        mnemonic: id.mnemonic.clone(),
+        cert: id.cert.clone(),
+    }
 }
 
 fn vault_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -44,15 +114,21 @@ fn settings_path(app: &AppHandle) -> Result<PathBuf, String> {
 
 #[derive(Serialize)]
 struct IdentityView {
+    /// Nome/alias scelto per questa identità (per una generata da
+    /// Sigillo coincide con lo User ID della chiave; per una importata è
+    /// un'etichetta separata, solo per l'interfaccia di Sigillo).
     display_name: String,
-    seed_phrase: String,
+    /// `None` per un'identità importata da una chiave esterna: non ha
+    /// una seed phrase Sigillo.
+    seed_phrase: Option<String>,
     seed_words: Vec<String>,
     fingerprint_hex: String,
     fingerprint_words: Vec<String>,
     public_key_armored: String,
+    is_imported: bool,
 }
 
-fn identity_view(id: &identity::Identity, display_name: &str) -> Result<IdentityView, String> {
+fn identity_view(id: &identity::Identity, alias: &str) -> Result<IdentityView, String> {
     let public_key_armored = String::from_utf8(
         sequoia_openpgp::serialize::SerializeInto::to_vec(&id.cert.armored())
             .map_err(|e| e.to_string())?,
@@ -60,26 +136,26 @@ fn identity_view(id: &identity::Identity, display_name: &str) -> Result<Identity
     .map_err(|e| e.to_string())?;
 
     Ok(IdentityView {
-        display_name: display_name.to_string(),
+        display_name: alias.to_string(),
         seed_phrase: id.seed_phrase(),
-        seed_words: id.seed_words().into_iter().map(str::to_string).collect(),
+        seed_words: id
+            .seed_words()
+            .map(|words| words.into_iter().map(str::to_string).collect())
+            .unwrap_or_default(),
         fingerprint_hex: id.cert.fingerprint().to_spaced_hex(),
         fingerprint_words: contacts::fingerprint_to_words(&id.cert.fingerprint())
             .into_iter()
             .map(str::to_string)
             .collect(),
         public_key_armored,
+        is_imported: id.mnemonic.is_none(),
     })
 }
 
-fn set_current_identity(state: &State<AppState>, id: identity::Identity, display_name: &str) {
-    *state.identity.lock().unwrap() = Some(id);
-    *state.display_name.lock().unwrap() = Some(display_name.to_string());
-}
-
-/// Vero se su questo dispositivo esiste già un'identità salvata: decide se
-/// l'app deve mostrare il wizard di generazione/import (primo avvio) o la
-/// schermata di sblocco con la sola passphrase (avvii successivi).
+/// Vero se su questo dispositivo esiste già un vault salvato (una o più
+/// identità): decide se l'app deve mostrare il wizard di
+/// generazione/import (primo avvio) o la schermata di sblocco con la
+/// sola passphrase (avvii successivi).
 #[tauri::command]
 fn identity_exists_on_disk(app: AppHandle) -> Result<bool, String> {
     Ok(storage::vault_exists(&vault_path(&app)?))
@@ -105,10 +181,16 @@ fn generate_identity(
 
     let id = identity::generate(words, name).map_err(|e| e.to_string())?;
     let view = identity_view(&id, name)?;
-    set_current_identity(&state, id, name);
+    *state.pending.lock().unwrap() = Some(LoadedIdentity {
+        alias: name.to_string(),
+        identity: id,
+    });
     Ok(view)
 }
 
+/// Reimporta un'identità Sigillo esistente dalla sua seed phrase (per
+/// portarla su un nuovo dispositivo, o per il passo di verifica subito
+/// dopo averla generata).
 #[tauri::command]
 fn import_identity(
     state: State<AppState>,
@@ -123,20 +205,58 @@ fn import_identity(
 
     let id = identity::import(&phrase, name).map_err(|e| e.to_string())?;
     let view = identity_view(&id, name)?;
-    set_current_identity(&state, id, name);
+    *state.pending.lock().unwrap() = Some(LoadedIdentity {
+        alias: name.to_string(),
+        identity: id,
+    });
+    Ok(view)
+}
+
+/// Importa una chiave privata OpenPGP generata altrove (GPG Suite,
+/// Kleopatra, un terminale con GnuPG...): `armored_tsk` è il contenuto
+/// del file .asc con la chiave privata completa, `key_passphrase` la sua
+/// eventuale passphrase originale (solo per sbloccarla ora: da qui in
+/// poi la protegge il vault di Sigillo), `alias` il nome scelto per
+/// riconoscerla nell'interfaccia di Sigillo.
+#[tauri::command]
+fn import_identity_external(
+    state: State<AppState>,
+    armored_tsk: String,
+    key_passphrase: Option<String>,
+    alias: String,
+) -> Result<IdentityView, String> {
+    let alias = if alias.trim().is_empty() {
+        "Chiave importata"
+    } else {
+        alias.trim()
+    };
+    let passphrase = key_passphrase.as_deref().filter(|p| !p.is_empty());
+
+    let id = identity::import_external(armored_tsk.as_bytes(), passphrase)
+        .map_err(|e| e.to_string())?;
+    let view = identity_view(&id, alias)?;
+    *state.pending.lock().unwrap() = Some(LoadedIdentity {
+        alias: alias.to_string(),
+        identity: id,
+    });
     Ok(view)
 }
 
 /// Ricontrolla che le parole indicate della seed phrase corrispondano a
-/// quelle mostrate, come nel wizard di conferma dei wallet Bitcoin.
+/// quelle mostrate, come nel wizard di conferma dei wallet Bitcoin. Non
+/// si applica a un'identità importata da chiave esterna (non ha una
+/// seed phrase da confermare: il wizard salta questo passo).
 #[tauri::command]
 fn confirm_seed_words(
     state: State<AppState>,
     positions_and_words: Vec<(u32, String)>,
 ) -> Result<bool, String> {
-    let guard = state.identity.lock().unwrap();
-    let id = guard.as_ref().ok_or("nessuna identità generata")?;
-    let words = id.seed_words();
+    let guard = state.pending.lock().unwrap();
+    let pending = guard.as_ref().ok_or("nessuna identità generata")?;
+    let words = pending
+        .identity
+        .seed_words()
+        .ok_or("questa identità non ha una seed phrase da confermare")?;
 
     for (position, word) in positions_and_words {
         let expected = words
@@ -149,53 +269,144 @@ fn confirm_seed_words(
     Ok(true)
 }
 
+/// Serializza il certificato (con materiale segreto) come TSK ASCII
+/// armored, senza protezione da password: usato solo per la
+/// persistenza interna nel vault di Sigillo, che lo protegge già da
+/// solo con la passphrase del dispositivo.
+fn serialize_tsk_armored(cert: &Cert) -> Result<String, String> {
+    let armored =
+        sequoia_openpgp::serialize::SerializeInto::to_vec(&cert.clone().as_tsk().armored())
+            .map_err(|e| e.to_string())?;
+    String::from_utf8(armored).map_err(|e| e.to_string())
+}
+
 /// Salva su disco, cifrata con `passphrase`, l'identità attualmente in
-/// memoria (generata o importata in questa sessione). Da chiamare come
-/// ultimo passo del wizard di primo avvio.
+/// sospeso (generata o importata in questa sessione, non ancora nel
+/// vault). Se sul dispositivo esiste già un vault, `passphrase` deve
+/// essere quella corrente: la nuova identità si aggiunge alle altre,
+/// non le sostituisce. Se è la primissima identità, `passphrase`
+/// diventa la passphrase del dispositivo da questo momento in poi.
+/// Restituisce l'elenco aggiornato di tutte le identità sul dispositivo.
 #[tauri::command]
 fn save_identity_to_disk(
     app: AppHandle,
     state: State<AppState>,
     passphrase: String,
-) -> Result<(), String> {
+) -> Result<Vec<IdentityView>, String> {
     if passphrase.len() < MIN_PASSPHRASE_LEN {
         return Err(format!(
             "la passphrase deve avere almeno {MIN_PASSPHRASE_LEN} caratteri"
         ));
     }
 
-    let guard = state.identity.lock().unwrap();
-    let id = guard.as_ref().ok_or("nessuna identità da salvare")?;
-    let name_guard = state.display_name.lock().unwrap();
-    let display_name = name_guard.as_deref().unwrap_or("Io");
+    let pending = state
+        .pending
+        .lock()
+        .unwrap()
+        .take()
+        .ok_or("nessuna identità da salvare")?;
 
     let path = vault_path(&app)?;
-    storage::save_identity(&path, &passphrase, display_name, &id.seed_phrase())
-        .map_err(|e| e.to_string())
+    let mut entries = if storage::vault_exists(&path) {
+        storage::load_vault(&path, &passphrase).map_err(|e| e.to_string())?
+    } else {
+        Vec::new()
+    };
+
+    let source = match pending.identity.seed_phrase() {
+        Some(phrase) => storage::EntrySource::Seed(phrase),
+        None => storage::EntrySource::ImportedTsk(serialize_tsk_armored(&pending.identity.cert)?),
+    };
+    entries.push(storage::VaultEntry {
+        alias: pending.alias.clone(),
+        source,
+    });
+
+    storage::save_vault(&path, &passphrase, &entries).map_err(|e| e.to_string())?;
+
+    let mut identities = state.identities.lock().unwrap();
+    identities.push(pending);
+    *state.active_index.lock().unwrap() = Some(identities.len() - 1);
+
+    identities
+        .iter()
+        .map(|li| identity_view(&li.identity, &li.alias))
+        .collect()
 }
 
-/// Sblocca, con la sola passphrase locale (non la seed phrase), l'identità
-/// già salvata su questo dispositivo.
+/// Ricostruisce le identità (cert + eventuale mnemonic) a partire dalle
+/// voci del vault già decifrate: usata sia da `unlock_identity` sia da
+/// `save_identity_to_disk` per restituire una vista aggiornata di tutte
+/// le identità senza dover tenere in memoria due rappresentazioni
+/// diverse dello stesso dato.
+fn identities_from_entries(entries: &[storage::VaultEntry]) -> Result<Vec<identity::Identity>, String> {
+    entries
+        .iter()
+        .map(|entry| match &entry.source {
+            storage::EntrySource::Seed(phrase) => {
+                identity::import(phrase, &entry.alias).map_err(|e| e.to_string())
+            }
+            storage::EntrySource::ImportedTsk(armored) => {
+                // Nel vault il materiale segreto e' gia' in chiaro
+                // (protetto dal vault stesso): non serve piu' la
+                // passphrase originale della chiave, fornita una sola
+                // volta al momento dell'import.
+                identity::import_external(armored.as_bytes(), None).map_err(|e| e.to_string())
+            }
+        })
+        .collect()
+}
+
+/// Sblocca, con la sola passphrase locale del dispositivo (non le seed
+/// phrase né le eventuali passphrase originali delle chiavi importate),
+/// tutte le identità salvate su questo dispositivo.
 #[tauri::command]
 fn unlock_identity(
     app: AppHandle,
     state: State<AppState>,
     passphrase: String,
-) -> Result<IdentityView, String> {
+) -> Result<Vec<IdentityView>, String> {
     let path = vault_path(&app)?;
-    let (display_name, seed_phrase) =
-        storage::load_identity(&path, &passphrase).map_err(|e| e.to_string())?;
+    let entries = storage::load_vault(&path, &passphrase).map_err(|e| e.to_string())?;
+    let identities = identities_from_entries(&entries)?;
 
-    let id = identity::import(&seed_phrase, &display_name).map_err(|e| e.to_string())?;
-    let view = identity_view(&id, &display_name)?;
-    set_current_identity(&state, id, &display_name);
-    Ok(view)
+    let views = entries
+        .iter()
+        .zip(&identities)
+        .map(|(entry, id)| identity_view(id, &entry.alias))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let loaded: Vec<LoadedIdentity> = entries
+        .into_iter()
+        .zip(identities)
+        .map(|(entry, identity)| LoadedIdentity {
+            alias: entry.alias,
+            identity,
+        })
+        .collect();
+
+    *state.identities.lock().unwrap() = loaded;
+    *state.active_index.lock().unwrap() = Some(0);
+
+    Ok(views)
 }
 
-/// Rimuove in modo sicuro l'identità salvata su questo dispositivo, e con
-/// essa la rubrica: dopo questa chiamata il prossimo avvio torna a
-/// mostrare il wizard di generazione/import, come al primo avvio, con una
-/// rubrica di nuovo vuota.
+/// Cambia quale identità è "attiva" (mostrata in "La mia identità",
+/// usata per firmare quando Scrivi non ne indica una diversa).
+#[tauri::command]
+fn set_active_identity(state: State<AppState>, index: usize) -> Result<(), String> {
+    let identities = state.identities.lock().unwrap();
+    if index >= identities.len() {
+        return Err("identità non valida".to_string());
+    }
+    *state.active_index.lock().unwrap() = Some(index);
+    Ok(())
+}
+
+/// Rimuove in modo sicuro l'intero vault salvato su questo dispositivo
+/// (tutte le identità), e con esso la rubrica: dopo questa chiamata il
+/// prossimo avvio torna a mostrare il wizard di generazione/import,
+/// come al primo avvio, con una rubrica di nuovo vuota.
 #[tauri::command]
 fn remove_identity_from_disk(app: AppHandle, state: State<AppState>) -> Result<(), String> {
     let path = vault_path(&app)?;
@@ -203,8 +414,9 @@ fn remove_identity_from_disk(app: AppHandle, state: State<AppState>) -> Result<(
     // La rubrica potrebbe non esistere ancora (nessun contatto mai
     // aggiunto): non è un errore, è il caso normale.
     let _ = std::fs::remove_file(contacts_path(&app)?);
-    *state.identity.lock().unwrap() = None;
-    *state.display_name.lock().unwrap() = None;
+    state.identities.lock().unwrap().clear();
+    *state.active_index.lock().unwrap() = None;
+    *state.pending.lock().unwrap() = None;
     Ok(())
 }
 
@@ -375,8 +587,7 @@ impl From<keyinfo::KeyDetail> for KeyDetailView {
 /// sezione "avanzate".
 #[tauri::command]
 fn my_technical_details(state: State<AppState>) -> Result<Vec<KeyDetailView>, String> {
-    let guard = state.identity.lock().unwrap();
-    let id = guard.as_ref().ok_or("genera o importa prima la tua identità")?;
+    let (_, id) = active_identity(&state)?;
     keyinfo::technical_details(&id.cert)
         .map(|details| details.into_iter().map(Into::into).collect())
         .map_err(|e| e.to_string())
@@ -397,8 +608,7 @@ fn contact_technical_details(armored_public_key: String) -> Result<Vec<KeyDetail
 /// (l'alternativa "meno consigliata" alla seed phrase).
 #[tauri::command]
 fn export_private_key_file(state: State<AppState>, password: String) -> Result<String, String> {
-    let guard = state.identity.lock().unwrap();
-    let id = guard.as_ref().ok_or("genera o importa prima la tua identità")?;
+    let (_, id) = active_identity(&state)?;
     identity::export_private_key_file(&id.cert, &password).map_err(|e| e.to_string())
 }
 
@@ -416,11 +626,9 @@ fn encrypt_message(
     recipients_armored: Vec<String>,
     plaintext: String,
     sign: bool,
+    sender_index: Option<usize>,
 ) -> Result<String, String> {
-    let guard = state.identity.lock().unwrap();
-    let id = guard
-        .as_ref()
-        .ok_or("genera o importa prima la tua identità")?;
+    let id = identity_by_index_or_active(&state, sender_index)?;
     let recipients = recipients_from_armored(&recipients_armored)?;
     message::encrypt(&id.cert, &recipients, &plaintext, sign).map_err(|e| e.to_string())
 }
@@ -440,11 +648,9 @@ fn encrypt_image(
     source_path: String,
     output_path: String,
     sign: bool,
+    sender_index: Option<usize>,
 ) -> Result<(), String> {
-    let guard = state.identity.lock().unwrap();
-    let id = guard
-        .as_ref()
-        .ok_or("genera o importa prima la tua identità")?;
+    let id = identity_by_index_or_active(&state, sender_index)?;
     let recipients = recipients_from_armored(&recipients_armored)?;
 
     let data = std::fs::read(&source_path)
@@ -488,11 +694,9 @@ fn encrypt_combined(
     source_path: String,
     output_path: String,
     sign: bool,
+    sender_index: Option<usize>,
 ) -> Result<(), String> {
-    let guard = state.identity.lock().unwrap();
-    let id = guard
-        .as_ref()
-        .ok_or("genera o importa prima la tua identità")?;
+    let id = identity_by_index_or_active(&state, sender_index)?;
     let recipients = recipients_from_armored(&recipients_armored)?;
 
     let image_data = std::fs::read(&source_path)
@@ -741,20 +945,51 @@ fn save_temp_media(temp_path: String, dest_path: String) -> Result<(), String> {
 /// messaggio di testo sia per un'immagine cifrata in formato .asc: in
 /// entrambi i casi l'input è testo ASCII armored). Il tipo di contenuto
 /// reale (testo/immagine/file) è determinato dopo la decifratura.
+/// Prova a decifrare `input` con ciascuna delle identità disponibili sul
+/// dispositivo, non solo quella attiva: un messaggio in arrivo potrebbe
+/// essere indirizzato a una qualsiasi delle identità dell'utente, non
+/// necessariamente quella scelta l'ultima volta in "La mia identità".
+/// Nucleo di `decrypt_with_any_identity`, separato per poter essere
+/// testato senza dover costruire un `State<AppState>` (che richiede il
+/// runtime di Tauri): prova `certs` uno per uno, nell'ordine dato,
+/// finché uno non riesce a decifrare `input`.
+fn decrypt_with_any_cert(
+    certs: &[Cert],
+    contacts_certs: &[Cert],
+    input: &[u8],
+) -> Result<message::DecryptedBytes, String> {
+    if certs.is_empty() {
+        return Err("genera o importa prima la tua identità".to_string());
+    }
+
+    let mut last_err = None;
+    for cert in certs {
+        match message::decrypt_bytes(cert, contacts_certs, input) {
+            Ok(result) => return Ok(result),
+            Err(e) => last_err = Some(e.to_string()),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| "impossibile decifrare il messaggio".to_string()))
+}
+
+fn decrypt_with_any_identity(
+    state: &State<AppState>,
+    contacts_certs: &[Cert],
+    input: &[u8],
+) -> Result<message::DecryptedBytes, String> {
+    let identities = state.identities.lock().unwrap();
+    let certs: Vec<Cert> = identities.iter().map(|li| li.identity.cert.clone()).collect();
+    decrypt_with_any_cert(&certs, contacts_certs, input)
+}
+
 #[tauri::command]
 fn decrypt_message(
     state: State<AppState>,
     contacts_armored: Vec<String>,
     ciphertext: String,
 ) -> Result<DecryptView, String> {
-    let guard = state.identity.lock().unwrap();
-    let id = guard
-        .as_ref()
-        .ok_or("genera o importa prima la tua identità")?;
     let contacts_certs = recipients_from_armored(&contacts_armored)?;
-
-    let decrypted = message::decrypt_bytes(&id.cert, &contacts_certs, ciphertext.as_bytes())
-        .map_err(|e| e.to_string())?;
+    let decrypted = decrypt_with_any_identity(&state, &contacts_certs, ciphertext.as_bytes())?;
 
     Ok(build_decrypt_view(
         decrypted.data,
@@ -772,15 +1007,10 @@ fn decrypt_file(
     contacts_armored: Vec<String>,
     path: String,
 ) -> Result<DecryptView, String> {
-    let guard = state.identity.lock().unwrap();
-    let id = guard
-        .as_ref()
-        .ok_or("genera o importa prima la tua identità")?;
     let contacts_certs = recipients_from_armored(&contacts_armored)?;
 
     let input = std::fs::read(&path).map_err(|e| format!("impossibile leggere il file: {e}"))?;
-    let decrypted =
-        message::decrypt_bytes(&id.cert, &contacts_certs, &input).map_err(|e| e.to_string())?;
+    let decrypted = decrypt_with_any_identity(&state, &contacts_certs, &input)?;
 
     Ok(build_decrypt_view(
         decrypted.data,
@@ -803,9 +1033,11 @@ pub fn run() {
             identity_exists_on_disk,
             generate_identity,
             import_identity,
+            import_identity_external,
             confirm_seed_words,
             save_identity_to_disk,
             unlock_identity,
+            set_active_identity,
             remove_identity_from_disk,
             load_contacts,
             add_contact,
@@ -829,6 +1061,43 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decrypt_with_any_cert_tries_every_identity_until_one_matches() {
+        let alice = identity::generate(identity::SeedWordCount::Twelve, "Alice").unwrap();
+        let bob = identity::generate(identity::SeedWordCount::Twelve, "Bob").unwrap();
+        let carol = identity::generate(identity::SeedWordCount::Twelve, "Carol").unwrap();
+
+        // Il mittente cifra per Carol, che sul dispositivo e' la TERZA
+        // identita' (non quella "attiva"/prima in elenco): deve comunque
+        // riuscire a decifrare, provando le identita' una per una.
+        let ciphertext =
+            message::encrypt(&alice.cert, &[carol.cert.clone()], "solo per Carol", false).unwrap();
+
+        let certs = vec![alice.cert.clone(), bob.cert.clone(), carol.cert.clone()];
+        let result = decrypt_with_any_cert(&certs, &[], ciphertext.as_bytes()).unwrap();
+        assert_eq!(String::from_utf8(result.data).unwrap(), "solo per Carol");
+    }
+
+    #[test]
+    fn decrypt_with_any_cert_fails_clearly_when_no_identity_matches() {
+        let alice = identity::generate(identity::SeedWordCount::Twelve, "Alice").unwrap();
+        let bob = identity::generate(identity::SeedWordCount::Twelve, "Bob").unwrap();
+        let mallory = identity::generate(identity::SeedWordCount::Twelve, "Mallory").unwrap();
+
+        let ciphertext =
+            message::encrypt(&alice.cert, &[bob.cert.clone()], "solo per Bob", false).unwrap();
+
+        // Sul dispositivo c'e' solo Mallory: nessuna identita' corrisponde.
+        let certs = vec![mallory.cert.clone()];
+        assert!(decrypt_with_any_cert(&certs, &[], ciphertext.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn decrypt_with_any_cert_reports_missing_identity_when_none_loaded() {
+        let err = decrypt_with_any_cert(&[], &[], b"qualunque cosa").unwrap_err();
+        assert!(err.contains("genera o importa"));
+    }
 
     #[test]
     fn detects_mp4_via_ftyp_isom_brand() {
