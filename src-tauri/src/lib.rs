@@ -446,6 +446,147 @@ fn set_image_format(app: AppHandle, format: String) -> Result<(), String> {
     settings::save_image_format(&settings_path(&app)?, format).map_err(|e| e.to_string())
 }
 
+/// Tutte le preferenze rilevanti per il frontend in un'unica risposta:
+/// evita un giro a parte per ciascuna (formato immagini escluso, che ha
+/// già i suoi comandi dedicati usati anche prima di questa funzione).
+#[derive(Serialize)]
+struct AppSettingsView {
+    experimental_features_enabled: bool,
+    tor_enabled: bool,
+    tor_socks_host: String,
+    tor_socks_port: u16,
+    timelock_custom_endpoint: Option<String>,
+}
+
+impl From<settings::Settings> for AppSettingsView {
+    fn from(s: settings::Settings) -> Self {
+        AppSettingsView {
+            experimental_features_enabled: s.experimental_features_enabled,
+            tor_enabled: s.tor_enabled,
+            tor_socks_host: s.tor_socks_host,
+            tor_socks_port: s.tor_socks_port,
+            timelock_custom_endpoint: s.timelock_custom_endpoint,
+        }
+    }
+}
+
+#[tauri::command]
+fn get_app_settings(app: AppHandle) -> Result<AppSettingsView, String> {
+    settings::load_settings(&settings_path(&app)?)
+        .map(Into::into)
+        .map_err(|e| e.to_string())
+}
+
+/// "Funzioni sperimentali" (Avanzate): finché disattivato, il resto
+/// dell'interfaccia legata al time-lock non deve comparire da nessuna
+/// parte, non solo essere disabilitata — è il frontend a occuparsene
+/// non renderizzando quella UI quando questo flag è spento.
+#[tauri::command]
+fn set_experimental_features_enabled(app: AppHandle, enabled: bool) -> Result<(), String> {
+    let path = settings_path(&app)?;
+    let mut current = settings::load_settings(&path).map_err(|e| e.to_string())?;
+    current.experimental_features_enabled = enabled;
+    settings::save_settings(&path, &current).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn set_tor_settings(
+    app: AppHandle,
+    enabled: bool,
+    socks_host: String,
+    socks_port: u16,
+    custom_endpoint: Option<String>,
+) -> Result<(), String> {
+    let path = settings_path(&app)?;
+    let mut current = settings::load_settings(&path).map_err(|e| e.to_string())?;
+    current.tor_enabled = enabled;
+    if !socks_host.trim().is_empty() {
+        current.tor_socks_host = socks_host.trim().to_string();
+    }
+    current.tor_socks_port = socks_port;
+    current.timelock_custom_endpoint = custom_endpoint.filter(|e| !e.trim().is_empty());
+    settings::save_settings(&path, &current).map_err(|e| e.to_string())
+}
+
+// ---------- Time-lock (funzione sperimentale) ----------
+
+const DEFAULT_TIMELOCK_ENDPOINT: &str = "https://mempool.space/api/blocks/tip/height";
+const TIMELOCK_HTTP_TIMEOUT_SECS: u64 = 20;
+
+/// Interroga `endpoint` (che deve rispondere con l'altezza blocco come
+/// numero semplice, come fa l'API pubblica di mempool.space) e
+/// restituisce l'altezza corrente. Se `use_tor` è attivo, la richiesta
+/// passa da un proxy SOCKS5 locale (un demone Tor già in esecuzione,
+/// non incorporato in Sigillo: per questo l'inizializzazione qui è solo
+/// la creazione di un client HTTP configurato, non l'avvio di un client
+/// Tor vero e proprio, che semplicemente non esiste dentro l'app).
+fn fetch_block_height(
+    endpoint: &str,
+    use_tor: bool,
+    tor_socks_host: &str,
+    tor_socks_port: u16,
+) -> Result<u32, String> {
+    let mut builder = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(TIMELOCK_HTTP_TIMEOUT_SECS));
+
+    if use_tor {
+        // "socks5h" (non "socks5"): la risoluzione del nome host avviene
+        // dal lato del proxy, indispensabile per un indirizzo .onion,
+        // che non esiste nel DNS normale.
+        let proxy_url = format!("socks5h://{tor_socks_host}:{tor_socks_port}");
+        let proxy = reqwest::Proxy::all(&proxy_url)
+            .map_err(|e| format!("configurazione del proxy Tor non valida: {e}"))?;
+        builder = builder.proxy(proxy);
+    }
+
+    let client = builder
+        .build()
+        .map_err(|e| format!("impossibile inizializzare il client di rete: {e}"))?;
+
+    let response = client.get(endpoint).send().map_err(|e| {
+        if use_tor {
+            format!(
+                "impossibile raggiungere {endpoint} tramite Tor (verifica che un client Tor sia in esecuzione su {tor_socks_host}:{tor_socks_port}): {e}"
+            )
+        } else {
+            format!("impossibile raggiungere {endpoint}: {e}")
+        }
+    })?;
+
+    let text = response
+        .error_for_status()
+        .map_err(|e| format!("l'endpoint ha risposto con un errore: {e}"))?
+        .text()
+        .map_err(|e| format!("impossibile leggere la risposta dell'endpoint: {e}"))?;
+
+    text.trim()
+        .parse::<u32>()
+        .map_err(|_| format!("risposta dell'endpoint non valida (attesa l'altezza blocco, un numero): \"{}\"", text.trim()))
+}
+
+fn effective_endpoint(custom: Option<&str>) -> String {
+    custom
+        .filter(|e| !e.trim().is_empty())
+        .unwrap_or(DEFAULT_TIMELOCK_ENDPOINT)
+        .to_string()
+}
+
+fn should_use_tor(endpoint: &str, local_tor_enabled: bool) -> bool {
+    endpoint.contains(".onion") || local_tor_enabled
+}
+
+/// Controlla l'altezza blocco corrente: usato sia per mostrare un
+/// riferimento mentre si sceglie l'altezza target in Scrivi, sia
+/// internamente per verificare se un messaggio bloccato si può ormai
+/// decifrare.
+#[tauri::command]
+fn check_block_height(app: AppHandle, custom_endpoint: Option<String>) -> Result<u32, String> {
+    let settings = settings::load_settings(&settings_path(&app)?).map_err(|e| e.to_string())?;
+    let endpoint = effective_endpoint(custom_endpoint.as_deref());
+    let use_tor = should_use_tor(&endpoint, settings.tor_enabled);
+    fetch_block_height(&endpoint, use_tor, &settings.tor_socks_host, settings.tor_socks_port)
+}
+
 #[derive(Serialize)]
 struct ContactView {
     name: String,
@@ -727,6 +868,62 @@ fn encrypt_combined(
     Ok(())
 }
 
+/// Cifra un messaggio (testo, e/o un'immagine o video) con un blocco
+/// temporale applicativo: il testo e l'eventuale allegato vengono prima
+/// impacchettati esattamente come in [`encrypt_combined`], poi avvolti
+/// da [`sigillo_core::timelock::encode`] con l'altezza blocco target e
+/// l'endpoint di verifica scelto (che finisce nei metadati del
+/// messaggio, cosi' anche chi lo riceve verifica con lo stesso
+/// endpoint), infine cifrati normalmente: il vincolo e' applicativo
+/// (lo fa rispettare l'interfaccia di Sigillo), non crittografico — chi
+/// ha la chiave privata giusta puo' comunque decifrare il pacchetto
+/// OpenPGP in ogni momento, e' solo il contenuto a restare "nascosto"
+/// dall'app finche' l'altezza non e' raggiunta.
+#[tauri::command]
+fn encrypt_timelocked(
+    app: AppHandle,
+    state: State<AppState>,
+    recipients_armored: Vec<String>,
+    plaintext: String,
+    source_path: Option<String>,
+    output_path: String,
+    sign: bool,
+    sender_index: Option<usize>,
+    target_height: u32,
+    custom_endpoint: Option<String>,
+) -> Result<(), String> {
+    let id = identity_by_index_or_active(&state, sender_index)?;
+    let recipients = recipients_from_armored(&recipients_armored)?;
+
+    let inner: Vec<u8> = match &source_path {
+        Some(source_path) => {
+            let media_data = std::fs::read(source_path)
+                .map_err(|e| format!("impossibile leggere il file: {e}"))?;
+            let media_filename = std::path::Path::new(source_path)
+                .file_name()
+                .map(|f| f.to_string_lossy().into_owned());
+            let media_mime =
+                detect_media_mime(&media_data).ok_or("formato immagine o video non riconosciuto")?;
+            sigillo_core::composite::encode(&plaintext, media_filename.as_deref(), media_mime, &media_data)
+        }
+        None => plaintext.into_bytes(),
+    };
+
+    let endpoint = custom_endpoint.filter(|e| !e.trim().is_empty());
+    let locked = sigillo_core::timelock::encode(target_height, endpoint.as_deref(), &inner);
+
+    let format = settings::load_image_format(&settings_path(&app)?).map_err(|e| e.to_string())?;
+    let armor = format == settings::ImageFormat::Asc;
+
+    let ciphertext = message::encrypt_bytes(&id.cert, &recipients, &locked, None, sign, armor)
+        .map_err(|e| e.to_string())?;
+
+    std::fs::write(&output_path, &ciphertext)
+        .map_err(|e| format!("impossibile salvare il file cifrato: {e}"))?;
+
+    Ok(())
+}
+
 /// Riconosce se `data` è un'immagine o un video nei formati comuni
 /// guardando i primi byte (che non cambiano cifrando/decifrando), non
 /// l'estensione del file: funziona anche se il mittente ha usato un
@@ -833,8 +1030,9 @@ fn media_view_fields(
 
 #[derive(Serialize)]
 struct DecryptView {
-    /// "testo", "immagine", "video", "combinato" (testo + immagine/video)
-    /// o "file" (contenuto binario non riconosciuto).
+    /// "testo", "immagine", "video", "combinato" (testo + immagine/video),
+    /// "bloccato_nel_tempo" (funzione sperimentale, altezza target non
+    /// ancora raggiunta) o "file" (contenuto binario non riconosciuto).
     kind: String,
     plaintext: Option<String>,
     image_data_base64: Option<String>,
@@ -846,12 +1044,28 @@ struct DecryptView {
     filename: Option<String>,
     signature_status: String,
     signer_fingerprint: Option<String>,
+    /// Solo per un messaggio con blocco temporale (bloccato o appena
+    /// sbloccato): l'altezza target.
+    target_height: Option<u32>,
+    /// Solo per "bloccato_nel_tempo": l'altezza corrente, se la
+    /// verifica è riuscita.
+    current_height: Option<u32>,
+    /// Solo per "bloccato_nel_tempo": presente se la verifica
+    /// dell'altezza corrente è fallita (rete assente, endpoint non
+    /// raggiungibile...), invece di current_height.
+    height_check_error: Option<String>,
 }
 
+/// Come [`build_decrypt_view_inner`], ma riconosce prima di tutto un
+/// eventuale blocco temporale (funzione sperimentale): se presente,
+/// verifica l'altezza blocco corrente (secondo le preferenze Tor/
+/// endpoint salvate) e mostra il contenuto solo se l'altezza target è
+/// già stata raggiunta, altrimenti quanto manca.
 fn build_decrypt_view(
     data: Vec<u8>,
     filename: Option<String>,
     signature: message::SignatureStatus,
+    settings: &settings::Settings,
 ) -> DecryptView {
     let (signature_status, signer_fingerprint) = match signature {
         message::SignatureStatus::Unsigned => ("non_firmato".to_string(), None),
@@ -861,6 +1075,75 @@ fn build_decrypt_view(
         message::SignatureStatus::Unverifiable => ("non_verificabile".to_string(), None),
     };
 
+    if sigillo_core::timelock::is_timelocked(&data) {
+        if let Ok(locked) = sigillo_core::timelock::decode(&data) {
+            let endpoint = effective_endpoint(locked.endpoint.as_deref());
+            let use_tor = should_use_tor(&endpoint, settings.tor_enabled);
+            match fetch_block_height(&endpoint, use_tor, &settings.tor_socks_host, settings.tor_socks_port) {
+                Ok(current) if current >= locked.target_height => {
+                    // Altezza raggiunta: si mostra il contenuto interno
+                    // come al solito, con in più l'indicazione che era
+                    // (ed è ora) sbloccato.
+                    let mut view = build_decrypt_view_inner(
+                        locked.inner,
+                        filename,
+                        signature_status,
+                        signer_fingerprint,
+                    );
+                    view.target_height = Some(locked.target_height);
+                    view.current_height = Some(current);
+                    return view;
+                }
+                Ok(current) => {
+                    return DecryptView {
+                        kind: "bloccato_nel_tempo".to_string(),
+                        plaintext: None,
+                        image_data_base64: None,
+                        image_mime: None,
+                        media_temp_path: None,
+                        filename,
+                        signature_status,
+                        signer_fingerprint,
+                        target_height: Some(locked.target_height),
+                        current_height: Some(current),
+                        height_check_error: None,
+                    };
+                }
+                Err(height_check_error) => {
+                    return DecryptView {
+                        kind: "bloccato_nel_tempo".to_string(),
+                        plaintext: None,
+                        image_data_base64: None,
+                        image_mime: None,
+                        media_temp_path: None,
+                        filename,
+                        signature_status,
+                        signer_fingerprint,
+                        target_height: Some(locked.target_height),
+                        current_height: None,
+                        height_check_error: Some(height_check_error),
+                    };
+                }
+            }
+        }
+        // Marcato come bloccato nel tempo ma illeggibile: ripiega sul
+        // trattarlo come gli altri casi, invece di far fallire tutto.
+    }
+
+    build_decrypt_view_inner(data, filename, signature_status, signer_fingerprint)
+}
+
+/// Nucleo di `build_decrypt_view`: riconosce testo/immagine/video/file,
+/// assumendo che `data` NON sia (più) un pacchetto con blocco temporale
+/// (quello è gestito da `build_decrypt_view`, che chiama questa funzione
+/// sia per un messaggio mai bloccato sia per il contenuto interno di
+/// uno appena sbloccato).
+fn build_decrypt_view_inner(
+    data: Vec<u8>,
+    filename: Option<String>,
+    signature_status: String,
+    signer_fingerprint: Option<String>,
+) -> DecryptView {
     // Va controllato prima degli altri due casi: un pacchetto combinato
     // non ha i byte magici di un'immagine/video puro, ma per puro caso
     // i suoi byte potrebbero comunque risultare UTF-8 valido, finendo
@@ -881,6 +1164,9 @@ fn build_decrypt_view(
                 filename: combined.image_filename,
                 signature_status,
                 signer_fingerprint,
+                target_height: None,
+                current_height: None,
+                height_check_error: None,
             };
         }
         // Pacchetto marcato come combinato ma illeggibile: ripiega sul
@@ -900,6 +1186,9 @@ fn build_decrypt_view(
             filename,
             signature_status,
             signer_fingerprint,
+            target_height: None,
+            current_height: None,
+            height_check_error: None,
         };
     }
 
@@ -913,6 +1202,9 @@ fn build_decrypt_view(
             filename,
             signature_status,
             signer_fingerprint,
+            target_height: None,
+            current_height: None,
+            height_check_error: None,
         };
     }
 
@@ -925,6 +1217,9 @@ fn build_decrypt_view(
         filename,
         signature_status,
         signer_fingerprint,
+        target_height: None,
+        current_height: None,
+        height_check_error: None,
     }
 }
 
@@ -984,17 +1279,20 @@ fn decrypt_with_any_identity(
 
 #[tauri::command]
 fn decrypt_message(
+    app: AppHandle,
     state: State<AppState>,
     contacts_armored: Vec<String>,
     ciphertext: String,
 ) -> Result<DecryptView, String> {
     let contacts_certs = recipients_from_armored(&contacts_armored)?;
     let decrypted = decrypt_with_any_identity(&state, &contacts_certs, ciphertext.as_bytes())?;
+    let settings = settings::load_settings(&settings_path(&app)?).map_err(|e| e.to_string())?;
 
     Ok(build_decrypt_view(
         decrypted.data,
         decrypted.filename,
         decrypted.signature,
+        &settings,
     ))
 }
 
@@ -1003,6 +1301,7 @@ fn decrypt_message(
 /// incollabili in una casella di testo).
 #[tauri::command]
 fn decrypt_file(
+    app: AppHandle,
     state: State<AppState>,
     contacts_armored: Vec<String>,
     path: String,
@@ -1011,11 +1310,13 @@ fn decrypt_file(
 
     let input = std::fs::read(&path).map_err(|e| format!("impossibile leggere il file: {e}"))?;
     let decrypted = decrypt_with_any_identity(&state, &contacts_certs, &input)?;
+    let settings = settings::load_settings(&settings_path(&app)?).map_err(|e| e.to_string())?;
 
     Ok(build_decrypt_view(
         decrypted.data,
         decrypted.filename,
         decrypted.signature,
+        &settings,
     ))
 }
 
@@ -1047,9 +1348,14 @@ pub fn run() {
             export_private_key_file,
             get_image_format,
             set_image_format,
+            get_app_settings,
+            set_experimental_features_enabled,
+            set_tor_settings,
+            check_block_height,
             encrypt_message,
             encrypt_image,
             encrypt_combined,
+            encrypt_timelocked,
             decrypt_message,
             decrypt_file,
             save_temp_media,
@@ -1097,6 +1403,83 @@ mod tests {
     fn decrypt_with_any_cert_reports_missing_identity_when_none_loaded() {
         let err = decrypt_with_any_cert(&[], &[], b"qualunque cosa").unwrap_err();
         assert!(err.contains("genera o importa"));
+    }
+
+    // ---------- Time-lock ----------
+
+    #[test]
+    fn effective_endpoint_falls_back_to_default_when_no_custom_one() {
+        assert_eq!(effective_endpoint(None), DEFAULT_TIMELOCK_ENDPOINT);
+        assert_eq!(effective_endpoint(Some("   ")), DEFAULT_TIMELOCK_ENDPOINT);
+        assert_eq!(effective_endpoint(Some("https://mio-nodo.esempio/altezza")), "https://mio-nodo.esempio/altezza");
+    }
+
+    #[test]
+    fn should_use_tor_is_false_by_default_for_a_normal_endpoint() {
+        // Requisito chiave: col toggle Tor spento e un endpoint normale,
+        // non deve mai risultare necessario un client Tor.
+        assert!(!should_use_tor(DEFAULT_TIMELOCK_ENDPOINT, false));
+    }
+
+    #[test]
+    fn should_use_tor_is_true_when_the_local_toggle_is_on() {
+        assert!(should_use_tor(DEFAULT_TIMELOCK_ENDPOINT, true));
+    }
+
+    #[test]
+    fn should_use_tor_is_forced_true_for_an_onion_endpoint_even_if_toggle_is_off() {
+        assert!(should_use_tor("http://esempio1234.onion/altezza", false));
+    }
+
+    /// Avvia un piccolo server HTTP locale (nessuna libreria esterna,
+    /// solo std) che risponde una volta con `body`, per testare il
+    /// parsing di fetch_block_height senza toccare la rete reale.
+    fn spawn_test_http_server(body: &'static str) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 512];
+                let _ = stream.read(&mut buf);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        format!("http://{addr}/")
+    }
+
+    #[test]
+    fn fetch_block_height_parses_a_plain_number_response() {
+        let endpoint = spawn_test_http_server("912345");
+        let height = fetch_block_height(&endpoint, false, "127.0.0.1", 9050).unwrap();
+        assert_eq!(height, 912_345);
+    }
+
+    #[test]
+    fn fetch_block_height_trims_surrounding_whitespace() {
+        let endpoint = spawn_test_http_server("  912345\n");
+        let height = fetch_block_height(&endpoint, false, "127.0.0.1", 9050).unwrap();
+        assert_eq!(height, 912_345);
+    }
+
+    #[test]
+    fn fetch_block_height_reports_non_numeric_response_clearly() {
+        let endpoint = spawn_test_http_server("<html>non e' un numero</html>");
+        let err = fetch_block_height(&endpoint, false, "127.0.0.1", 9050).unwrap_err();
+        assert!(err.contains("non valida"));
+    }
+
+    #[test]
+    fn fetch_block_height_reports_unreachable_endpoint_clearly() {
+        // Nessun server in ascolto su questa porta: deve fallire con un
+        // messaggio comprensibile, non andare in panico.
+        let err = fetch_block_height("http://127.0.0.1:1/", false, "127.0.0.1", 9050).unwrap_err();
+        assert!(err.contains("impossibile raggiungere"));
     }
 
     #[test]

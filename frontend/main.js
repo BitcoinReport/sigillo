@@ -19,6 +19,17 @@ let activeIdentityIndex = 0;
 let pendingSeedWords = [];
 let currentImageFormat = "asc";
 
+// Funzioni sperimentali (disattivate di default): finche' spente, la UI
+// del blocco temporale non deve comparire da nessuna parte, non solo
+// essere disabilitata — vedi renderExperimentalFeaturesUi().
+let experimentalFeaturesEnabled = false;
+let torSettings = { enabled: false, socksHost: "127.0.0.1", socksPort: 9050, customEndpoint: null };
+
+// L'ultima richiesta di decifratura effettuata (testo incollato o file
+// aperto): serve al pulsante "Controlla di nuovo" di un messaggio
+// bloccato nel tempo, per ripetere esattamente la stessa chiamata.
+let lastDecryptRequest = null; // { kind: "message", ciphertext } oppure { kind: "file", path }
+
 // Indice (in "contacts") del contatto attualmente aperto nella scheda
 // dettaglio, o null quando quella schermata non è la vista corrente.
 let contactDetailIndex = null;
@@ -273,6 +284,42 @@ async function applyIdentitiesList(views, activeIdx) {
   } catch (err) {
     currentImageFormat = "asc";
   }
+
+  try {
+    const settings = await invoke("get_app_settings");
+    experimentalFeaturesEnabled = settings.experimental_features_enabled;
+    torSettings = {
+      enabled: settings.tor_enabled,
+      socksHost: settings.tor_socks_host,
+      socksPort: settings.tor_socks_port,
+      customEndpoint: settings.timelock_custom_endpoint,
+    };
+  } catch (err) {
+    experimentalFeaturesEnabled = false;
+  }
+  renderExperimentalFeaturesUi();
+}
+
+// Punto unico da cui dipende tutta la visibilita' della UI legata alle
+// funzioni sperimentali: col flag spento, nessuno di questi elementi
+// deve essere visibile da nessuna parte dell'app (non solo disabilitato).
+function renderExperimentalFeaturesUi() {
+  document.getElementById("experimental-features-toggle").checked = experimentalFeaturesEnabled;
+  document.getElementById("experimental-features-panel").hidden = !experimentalFeaturesEnabled;
+  document.getElementById("timelock-option-row").hidden = !experimentalFeaturesEnabled;
+  if (!experimentalFeaturesEnabled) {
+    // Se l'utente disattiva le funzioni sperimentali con l'opzione di
+    // blocco temporale gia' selezionata in Scrivi, la si ripristina
+    // anche internamente, non solo visivamente.
+    document.getElementById("timelock-toggle").checked = false;
+    document.getElementById("timelock-fields").hidden = true;
+  }
+
+  document.getElementById("tor-toggle").checked = torSettings.enabled;
+  document.getElementById("tor-fields").hidden = !torSettings.enabled;
+  document.getElementById("tor-socks-host").value = torSettings.socksHost;
+  document.getElementById("tor-socks-port").value = String(torSettings.socksPort);
+  document.getElementById("timelock-custom-endpoint").value = torSettings.customEndpoint || "";
 }
 
 document.getElementById("identity-switcher").addEventListener("change", async (e) => {
@@ -975,6 +1022,23 @@ document.getElementById("sign-message").addEventListener(
   { once: true }
 );
 
+document.getElementById("timelock-toggle").addEventListener("change", async (e) => {
+  const enabled = e.target.checked;
+  document.getElementById("timelock-fields").hidden = !enabled;
+  setError("timelock-error", null);
+  if (!enabled) return;
+
+  const hint = document.getElementById("timelock-current-height-hint");
+  hint.textContent = "Verifica dell'altezza attuale...";
+  try {
+    const current = await invoke("check_block_height", { customEndpoint: torSettings.customEndpoint });
+    hint.textContent = `Altezza blocco attuale: ${current.toLocaleString("it-IT")} (circa 10 minuti per blocco).`;
+  } catch (err) {
+    hint.textContent = "";
+    setError("timelock-error", `Impossibile verificare l'altezza attuale: ${err}`);
+  }
+});
+
 document.getElementById("btn-encrypt").addEventListener("click", async (e) => {
   setError("encrypt-error", null);
   document.getElementById("encrypt-result").hidden = true;
@@ -998,12 +1062,54 @@ document.getElementById("btn-encrypt").addEventListener("click", async (e) => {
     return;
   }
 
+  const timelockEnabled =
+    experimentalFeaturesEnabled && document.getElementById("timelock-toggle").checked;
+  let targetHeight = null;
+  if (timelockEnabled) {
+    setError("timelock-error", null);
+    const raw = document.getElementById("timelock-target-height").value.trim();
+    targetHeight = Number(raw);
+    if (!raw || !Number.isInteger(targetHeight) || targetHeight <= 0) {
+      setError("timelock-error", "Inserisci un'altezza blocco valida (un numero intero positivo).");
+      return;
+    }
+  }
+
   try {
     await withLoading(e.currentTarget, async () => {
       let textDone = false;
       let imageDone = false;
 
-      if (plaintext && attachedImagePath) {
+      if (timelockEnabled) {
+        // Blocco temporale (sperimentale): testo ed eventuale allegato
+        // finiscono comunque in un unico file, come in encrypt_combined,
+        // ma avvolti in un pacchetto che l'interfaccia di Sigillo non
+        // mostrera' finche' l'altezza blocco scelta non e' raggiunta.
+        const sourceName = attachedImagePath ? attachedImagePath.split(/[\\/]/).pop() : "messaggio";
+        const ext = currentImageFormat === "gpg" ? "gpg" : "asc";
+        const outputPath = await save({
+          defaultPath: `${sourceName}.bloccato.${ext}`,
+          filters: [{ name: "Messaggio cifrato", extensions: [ext] }],
+        });
+        if (outputPath) {
+          await invoke("encrypt_timelocked", {
+            recipientsArmored: selected,
+            plaintext,
+            sourcePath: attachedImagePath || null,
+            outputPath,
+            sign,
+            senderIndex,
+            targetHeight,
+            customEndpoint: torSettings.customEndpoint,
+          });
+          document.getElementById("encrypt-image-result-label").textContent =
+            "Messaggio bloccato salvato:";
+          document.getElementById("encrypt-image-saved-path").textContent = outputPath;
+          document.getElementById("encrypt-image-result").hidden = false;
+          textDone = true;
+          imageDone = !!attachedImagePath;
+        }
+      } else if (plaintext && attachedImagePath) {
         // Testo e immagine insieme: un unico file cifrato, cosi' chi lo
         // riceve li ritrova entrambi aprendolo una sola volta (come un
         // messaggio con didascalia e foto), invece di due file separati.
@@ -1082,6 +1188,10 @@ document.getElementById("btn-encrypt").addEventListener("click", async (e) => {
           checkbox.checked = false;
         }
         document.getElementById("sign-message").checked = false;
+        document.getElementById("timelock-toggle").checked = false;
+        document.getElementById("timelock-fields").hidden = true;
+        document.getElementById("timelock-target-height").value = "";
+        setError("timelock-error", null);
       }
     });
   } catch (err) {
@@ -1154,6 +1264,34 @@ function showDecryptedMedia(result) {
   img.src = `data:${result.image_mime};base64,${result.image_data_base64}`;
 }
 
+function formatBlocksEta(blocksRemaining) {
+  const minutes = blocksRemaining * 10;
+  if (minutes < 60) return `circa ${minutes} minuti`;
+  const hours = minutes / 60;
+  if (hours < 48) return `circa ${hours.toFixed(1)} ore`;
+  return `circa ${(hours / 24).toFixed(1)} giorni`;
+}
+
+function renderTimelockedResult(result) {
+  document.getElementById("timelocked-target").textContent =
+    result.target_height.toLocaleString("it-IT");
+  const progress = document.getElementById("timelocked-progress");
+  const errorEl = document.getElementById("timelocked-error");
+
+  if (result.height_check_error) {
+    progress.hidden = true;
+    errorEl.hidden = false;
+    errorEl.textContent = `Non riesco a verificare l'altezza attuale: ${result.height_check_error}`;
+  } else {
+    errorEl.hidden = true;
+    progress.hidden = false;
+    const remaining = result.target_height - result.current_height;
+    progress.textContent =
+      `Altezza attuale: ${result.current_height.toLocaleString("it-IT")}. ` +
+      `Mancano ${remaining.toLocaleString("it-IT")} blocchi (${formatBlocksEta(remaining)}).`;
+  }
+}
+
 function renderDecryptResult(result) {
   lastDecrypted = null;
 
@@ -1177,11 +1315,16 @@ function renderDecryptResult(result) {
   const textBlock = document.getElementById("decrypt-result-text");
   const imageBlock = document.getElementById("decrypt-result-image");
   const fileBlock = document.getElementById("decrypt-result-file");
+  const timelockedBlock = document.getElementById("decrypt-result-timelocked");
   textBlock.hidden = true;
   imageBlock.hidden = true;
   fileBlock.hidden = true;
+  timelockedBlock.hidden = true;
 
-  if (result.kind === "testo") {
+  if (result.kind === "bloccato_nel_tempo") {
+    renderTimelockedResult(result);
+    timelockedBlock.hidden = false;
+  } else if (result.kind === "testo") {
     document.getElementById("plaintext-out").value = result.plaintext;
     textBlock.hidden = false;
   } else if (result.kind === "immagine" || result.kind === "video" || result.kind === "combinato") {
@@ -1215,6 +1358,7 @@ document.getElementById("btn-load-file").addEventListener("click", async (e) => 
     const result = await withLoading(button, () =>
       invoke("decrypt_file", { contactsArmored: contacts.map((c) => c.key), path })
     );
+    lastDecryptRequest = { kind: "file", path };
     renderDecryptResult(result);
   } catch (err) {
     setError("decrypt-error", String(err));
@@ -1235,6 +1379,23 @@ document.getElementById("btn-decrypt").addEventListener("click", async (e) => {
     const result = await withLoading(e.currentTarget, () =>
       invoke("decrypt_message", { contactsArmored: contacts.map((c) => c.key), ciphertext })
     );
+    lastDecryptRequest = { kind: "message", ciphertext };
+    renderDecryptResult(result);
+  } catch (err) {
+    setError("decrypt-error", String(err));
+  }
+});
+
+document.getElementById("btn-recheck-timelock").addEventListener("click", async (e) => {
+  if (!lastDecryptRequest) return;
+  setError("decrypt-error", null);
+  try {
+    const result = await withLoading(e.currentTarget, () => {
+      const contactsArmored = contacts.map((c) => c.key);
+      return lastDecryptRequest.kind === "file"
+        ? invoke("decrypt_file", { contactsArmored, path: lastDecryptRequest.path })
+        : invoke("decrypt_message", { contactsArmored, ciphertext: lastDecryptRequest.ciphertext });
+    });
     renderDecryptResult(result);
   } catch (err) {
     setError("decrypt-error", String(err));
@@ -1311,6 +1472,8 @@ function renderTechDetail(container, detail) {
 }
 
 async function populateAdvancedScreen() {
+  renderExperimentalFeaturesUi();
+
   document.getElementById("adv-my-fingerprint-hex").textContent =
     identities[activeIdentityIndex] ? identities[activeIdentityIndex].fingerprintHex : "";
 
@@ -1388,6 +1551,74 @@ for (const radio of document.querySelectorAll('input[name="image-format"]')) {
     }
   });
 }
+
+// ---------- Funzioni sperimentali e blocco temporale (Avanzate) ----------
+
+document.getElementById("experimental-features-toggle").addEventListener("change", async (e) => {
+  setError("experimental-features-error", null);
+  const enabled = e.target.checked;
+  try {
+    await invoke("set_experimental_features_enabled", { enabled });
+    experimentalFeaturesEnabled = enabled;
+    renderExperimentalFeaturesUi();
+  } catch (err) {
+    e.target.checked = !enabled;
+    setError("experimental-features-error", String(err));
+  }
+});
+
+document.getElementById("tor-toggle").addEventListener("change", async (e) => {
+  setError("tor-settings-error", null);
+  const enabled = e.target.checked;
+  document.getElementById("tor-fields").hidden = !enabled;
+  try {
+    await invoke("set_tor_settings", {
+      enabled,
+      socksHost: document.getElementById("tor-socks-host").value,
+      socksPort: Number(document.getElementById("tor-socks-port").value) || 9050,
+      customEndpoint: document.getElementById("timelock-custom-endpoint").value || null,
+    });
+    torSettings.enabled = enabled;
+  } catch (err) {
+    e.target.checked = !enabled;
+    document.getElementById("tor-fields").hidden = !e.target.checked;
+    setError("tor-settings-error", String(err));
+  }
+});
+
+document.getElementById("btn-save-tor-settings").addEventListener("click", async (e) => {
+  setError("tor-settings-error", null);
+  document.getElementById("tor-settings-saved-hint").hidden = true;
+  const socksHost = document.getElementById("tor-socks-host").value.trim();
+  const socksPortRaw = document.getElementById("tor-socks-port").value.trim();
+  const socksPort = Number(socksPortRaw);
+  const customEndpoint = document.getElementById("timelock-custom-endpoint").value.trim();
+
+  if (!socksPortRaw || !Number.isInteger(socksPort) || socksPort <= 0 || socksPort > 65535) {
+    setError("tor-settings-error", "La porta SOCKS5 deve essere un numero tra 1 e 65535.");
+    return;
+  }
+
+  try {
+    await withLoading(e.currentTarget, () =>
+      invoke("set_tor_settings", {
+        enabled: document.getElementById("tor-toggle").checked,
+        socksHost,
+        socksPort,
+        customEndpoint: customEndpoint || null,
+      })
+    );
+    torSettings = {
+      enabled: document.getElementById("tor-toggle").checked,
+      socksHost,
+      socksPort,
+      customEndpoint: customEndpoint || null,
+    };
+    document.getElementById("tor-settings-saved-hint").hidden = false;
+  } catch (err) {
+    setError("tor-settings-error", String(err));
+  }
+});
 
 document.getElementById("btn-export-tsk").addEventListener("click", async (e) => {
   setError("export-tsk-error", null);

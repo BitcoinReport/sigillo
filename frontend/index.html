@@ -260,6 +260,19 @@
             verificare che sei stato davvero tu a scriverlo.
           </p>
 
+          <div id="timelock-option-row" hidden>
+            <label class="checkbox-row">
+              <input type="checkbox" id="timelock-toggle" />
+              Blocca fino al blocco...
+            </label>
+            <div id="timelock-fields" hidden>
+              <label for="timelock-target-height">Altezza blocco target</label>
+              <input id="timelock-target-height" type="text" inputmode="numeric" placeholder="Es. 900000" />
+              <p id="timelock-current-height-hint" class="hint"></p>
+              <p id="timelock-error" class="error" hidden></p>
+            </div>
+          </div>
+
           <div class="button-row">
             <button id="btn-encrypt" class="primary">Cifra</button>
           </div>
@@ -382,6 +395,18 @@
               </p>
               <div class="button-row">
                 <button id="btn-save-decrypted-file" class="secondary">Salva file...</button>
+              </div>
+            </div>
+
+            <div id="decrypt-result-timelocked" hidden>
+              <p class="warning">
+                🔒 Questo messaggio è bloccato fino al blocco
+                <strong id="timelocked-target"></strong>.
+              </p>
+              <p id="timelocked-progress" class="hint"></p>
+              <p id="timelocked-error" class="hint" hidden></p>
+              <div class="button-row">
+                <button id="btn-recheck-timelock" class="secondary">Controlla di nuovo</button>
               </div>
             </div>
           </div>
@@ -546,6 +571,67 @@
           sai già cosa significa.
         </p>
         <p id="image-format-error" class="error" hidden></p>
+
+        <hr />
+
+        <h3>Funzioni sperimentali</h3>
+        <p class="hint">
+          Funzioni non ancora definitive, pensate per chi vuole
+          esplorare qualcosa in più. Disattivate per impostazione
+          predefinita.
+        </p>
+        <label class="checkbox-row">
+          <input type="checkbox" id="experimental-features-toggle" />
+          Attiva le funzioni sperimentali
+        </label>
+        <p id="experimental-features-error" class="error" hidden></p>
+
+        <div id="experimental-features-panel" hidden>
+          <h4>Blocco temporale dei messaggi (per gioco)</h4>
+          <p class="hint">
+            Attivandola, in "Scrivi" compare la possibilità di bloccare
+            un messaggio finché la blockchain Bitcoin non raggiunge
+            un'altezza blocco scelta da te. È un blocco applicativo "per
+            gioco" tra persone, non una garanzia crittografica: chi ha
+            la chiave giusta potrebbe comunque decifrare il messaggio
+            OpenPGP prima, è solo l'interfaccia di Sigillo a nascondere
+            il contenuto finché l'altezza non è raggiunta.
+          </p>
+
+          <label class="checkbox-row">
+            <input type="checkbox" id="tor-toggle" />
+            Verifica l'altezza blocco tramite Tor
+          </label>
+          <p class="hint">
+            Instrada la verifica attraverso un client Tor già in
+            esecuzione sul tuo computer (es. Tor Browser, o il
+            programma "tor" da riga di comando) — Sigillo non include
+            un client Tor proprio. Disattivata per impostazione
+            predefinita: senza, la verifica avviene in chiaro verso il
+            servizio pubblico predefinito (mempool.space).
+          </p>
+
+          <div id="tor-fields" hidden>
+            <label for="tor-socks-host">Host SOCKS5</label>
+            <input id="tor-socks-host" type="text" placeholder="127.0.0.1" />
+
+            <label for="tor-socks-port">Porta SOCKS5</label>
+            <input id="tor-socks-port" type="text" placeholder="9050" />
+          </div>
+
+          <label for="timelock-custom-endpoint">Endpoint di verifica personalizzato (facoltativo)</label>
+          <input id="timelock-custom-endpoint" type="text" placeholder="Es. il tuo nodo, o un indirizzo .onion — vuoto per usare mempool.space" />
+          <p class="hint">
+            Un indirizzo che termina in ".onion" richiede comunque Tor
+            per essere raggiunto, anche con il toggle sopra spento.
+          </p>
+
+          <div class="button-row">
+            <button id="btn-save-tor-settings" class="secondary">Salva impostazioni</button>
+          </div>
+          <p id="tor-settings-error" class="error" hidden></p>
+          <p id="tor-settings-saved-hint" class="hint" hidden>Impostazioni salvate.</p>
+        </div>
 
         <hr />
 
