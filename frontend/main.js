@@ -1029,7 +1029,9 @@ document.getElementById("timelock-toggle").addEventListener("change", async (e) 
   if (!enabled) return;
 
   const hint = document.getElementById("timelock-current-height-hint");
-  hint.textContent = "Verifica dell'altezza attuale...";
+  hint.textContent = torSettings.enabled
+    ? "Verifica dell'altezza attuale tramite Tor... può richiedere fino a un minuto, soprattutto la prima volta."
+    : "Verifica dell'altezza attuale...";
   try {
     const current = await invoke("check_block_height", { customEndpoint: torSettings.customEndpoint });
     hint.textContent = `Altezza blocco attuale: ${current.toLocaleString("it-IT")} (circa 10 minuti per blocco).`;

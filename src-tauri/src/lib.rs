@@ -511,7 +511,21 @@ fn set_tor_settings(
 // ---------- Time-lock (funzione sperimentale) ----------
 
 const DEFAULT_TIMELOCK_ENDPOINT: &str = "https://mempool.space/api/blocks/tip/height";
-const TIMELOCK_HTTP_TIMEOUT_SECS: u64 = 20;
+
+// Una richiesta diretta (senza Tor) è normalmente rapida: 20 secondi
+// sono già ampiamente sufficienti anche con una rete lenta.
+const CLEARNET_HTTP_TIMEOUT_SECS: u64 = 20;
+
+// Un demone Tor "a freddo" (appena avviato, o comunque senza un
+// circuito già pronto) può impiegare anche svariate decine di secondi
+// per costruire un nuovo circuito alla prima richiesta: un Tor Browser
+// già aperto ha spesso circuiti pronti e risponde molto più in fretta,
+// ma non è corretto assumere che sia sempre così (es. un demone Tor
+// standalone lanciato da poco, come `tor`/Homebrew, senza un browser
+// aperto). Margini generosi per non scambiare per un errore quello che
+// è solo un circuito Tor lento a formarsi.
+const TOR_CONNECT_TIMEOUT_SECS: u64 = 60;
+const TOR_TOTAL_TIMEOUT_SECS: u64 = 90;
 
 /// Interroga `endpoint` (che deve rispondere con l'altezza blocco come
 /// numero semplice, come fa l'API pubblica di mempool.space) e
@@ -526,8 +540,37 @@ fn fetch_block_height(
     tor_socks_host: &str,
     tor_socks_port: u16,
 ) -> Result<u32, String> {
-    let mut builder = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(TIMELOCK_HTTP_TIMEOUT_SECS));
+    let (connect_timeout, total_timeout) = if use_tor {
+        (
+            std::time::Duration::from_secs(TOR_CONNECT_TIMEOUT_SECS),
+            std::time::Duration::from_secs(TOR_TOTAL_TIMEOUT_SECS),
+        )
+    } else {
+        let t = std::time::Duration::from_secs(CLEARNET_HTTP_TIMEOUT_SECS);
+        (t, t)
+    };
+    fetch_block_height_with_timeouts(
+        endpoint,
+        use_tor,
+        tor_socks_host,
+        tor_socks_port,
+        connect_timeout,
+        total_timeout,
+    )
+}
+
+/// Nucleo di `fetch_block_height` con i timeout esposti come parametri,
+/// per poter essere testato con valori brevi invece di dover aspettare
+/// i timeout (generosi apposta) usati in produzione.
+fn fetch_block_height_with_timeouts(
+    endpoint: &str,
+    use_tor: bool,
+    tor_socks_host: &str,
+    tor_socks_port: u16,
+    connect_timeout: std::time::Duration,
+    total_timeout: std::time::Duration,
+) -> Result<u32, String> {
+    let mut builder = reqwest::blocking::Client::builder().timeout(total_timeout);
 
     if use_tor {
         // "socks5h" (non "socks5"): la risoluzione del nome host avviene
@@ -536,7 +579,7 @@ fn fetch_block_height(
         let proxy_url = format!("socks5h://{tor_socks_host}:{tor_socks_port}");
         let proxy = reqwest::Proxy::all(&proxy_url)
             .map_err(|e| format!("configurazione del proxy Tor non valida: {e}"))?;
-        builder = builder.proxy(proxy);
+        builder = builder.proxy(proxy).connect_timeout(connect_timeout);
     }
 
     let client = builder
@@ -544,13 +587,7 @@ fn fetch_block_height(
         .map_err(|e| format!("impossibile inizializzare il client di rete: {e}"))?;
 
     let response = client.get(endpoint).send().map_err(|e| {
-        if use_tor {
-            format!(
-                "impossibile raggiungere {endpoint} tramite Tor (verifica che un client Tor sia in esecuzione su {tor_socks_host}:{tor_socks_port}): {e}"
-            )
-        } else {
-            format!("impossibile raggiungere {endpoint}: {e}")
-        }
+        describe_block_height_request_error(&e, endpoint, use_tor, tor_socks_host, tor_socks_port)
     })?;
 
     let text = response
@@ -562,6 +599,41 @@ fn fetch_block_height(
     text.trim()
         .parse::<u32>()
         .map_err(|_| format!("risposta dell'endpoint non valida (attesa l'altezza blocco, un numero): \"{}\"", text.trim()))
+}
+
+/// Traduce un errore di rete in un messaggio che distingue i casi più
+/// comuni (nessun servizio in ascolto sulla porta indicata, timeout...)
+/// invece di limitarsi a un messaggio generico: soprattutto per Tor,
+/// dove le cause tipiche (demone non avviato, porta sbagliata, circuito
+/// lento a formarsi) richiedono reazioni diverse da parte dell'utente.
+fn describe_block_height_request_error(
+    err: &reqwest::Error,
+    endpoint: &str,
+    use_tor: bool,
+    tor_socks_host: &str,
+    tor_socks_port: u16,
+) -> String {
+    if !use_tor {
+        return format!("impossibile raggiungere {endpoint}: {err}");
+    }
+
+    // L'ordine conta: un timeout durante la fase di connessione può
+    // soddisfare anche is_connect() (e' comunque fallito "durante la
+    // connessione"), ma il messaggio piu' utile in quel caso e' quello
+    // sul timeout, non quello che suggerisce "nessun servizio in
+    // ascolto" (che varrebbe solo per un rifiuto immediato, senza
+    // alcuna attesa).
+    if err.is_timeout() {
+        format!(
+            "il proxy Tor su {tor_socks_host}:{tor_socks_port} non ha risposto in tempo: se il client Tor è stato avviato da poco, il circuito potrebbe impiegare più tempo del solito a formarsi la prima volta. Riprova tra qualche istante."
+        )
+    } else if err.is_connect() {
+        format!(
+            "impossibile connettersi al proxy Tor su {tor_socks_host}:{tor_socks_port}: verifica che un client Tor (demone standalone, Tor Browser...) sia davvero in ascolto su quella porta. Dettagli: {err}"
+        )
+    } else {
+        format!("impossibile raggiungere {endpoint} tramite Tor ({tor_socks_host}:{tor_socks_port}): {err}")
+    }
 }
 
 fn effective_endpoint(custom: Option<&str>) -> String {
@@ -1480,6 +1552,82 @@ mod tests {
         // messaggio comprensibile, non andare in panico.
         let err = fetch_block_height("http://127.0.0.1:1/", false, "127.0.0.1", 9050).unwrap_err();
         assert!(err.contains("impossibile raggiungere"));
+    }
+
+    // Regressione: il bug segnalato era un timeout troppo aggressivo
+    // (20s totali) per un demone Tor "a freddo" (es. la porta standalone
+    // 9050 di `brew services start tor`, senza circuiti gia' pronti),
+    // mentre un Tor Browser gia' aperto (9150) ha circuiti pronti e
+    // maschera il problema rispondendo piu' in fretta. I timeout ora
+    // sono nettamente piu' generosi per il percorso Tor.
+    #[test]
+    fn tor_timeouts_are_generous_enough_for_a_cold_circuit() {
+        assert!(
+            TOR_CONNECT_TIMEOUT_SECS >= 45,
+            "il timeout di connessione per Tor e' di nuovo troppo aggressivo per un circuito a freddo"
+        );
+        assert!(
+            TOR_TOTAL_TIMEOUT_SECS >= 60,
+            "il timeout totale per Tor e' di nuovo troppo aggressivo per un circuito a freddo"
+        );
+    }
+
+    #[test]
+    fn fetch_block_height_reports_connect_refused_through_tor_distinctly() {
+        // Nessun proxy in ascolto su questa porta: deve dire chiaramente
+        // di verificare che un client Tor sia davvero in ascolto,
+        // non un messaggio generico o "timeout".
+        let err = fetch_block_height_with_timeouts(
+            DEFAULT_TIMELOCK_ENDPOINT,
+            true,
+            "127.0.0.1",
+            1,
+            std::time::Duration::from_millis(500),
+            std::time::Duration::from_millis(500),
+        )
+        .unwrap_err();
+        assert!(err.contains("impossibile connettersi al proxy Tor"));
+    }
+
+    #[test]
+    #[ignore = "richiede un vero demone Tor standalone in ascolto su 127.0.0.1:9050 (es. `brew services start tor`), non adatto alla CI: esegui con `cargo test -- --ignored`"]
+    fn fetch_block_height_works_against_a_real_standalone_tor_daemon_on_9050() {
+        // Riproduce esattamente lo scenario segnalato: un demone Tor
+        // standalone (non Tor Browser) sulla sua porta di default 9050,
+        // verso il vero endpoint pubblico di produzione.
+        let height = fetch_block_height(DEFAULT_TIMELOCK_ENDPOINT, true, "127.0.0.1", 9050)
+            .expect("la richiesta verso mempool.space tramite Tor (porta 9050) deve riuscire");
+        assert!(height > 900_000, "altezza blocco implausibile: {height}");
+    }
+
+    #[test]
+    fn fetch_block_height_reports_slow_tor_circuit_as_timeout_not_connect_refused() {
+        // Un "proxy" che accetta la connessione TCP ma non risponde mai
+        // simula un circuito Tor lento a formarsi: il messaggio deve
+        // parlare di timeout/circuito lento, non di "nessun servizio in
+        // ascolto" (che varrebbe solo per un rifiuto immediato).
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                drop(stream);
+            }
+        });
+
+        let err = fetch_block_height_with_timeouts(
+            DEFAULT_TIMELOCK_ENDPOINT,
+            true,
+            "127.0.0.1",
+            addr.port(),
+            std::time::Duration::from_millis(300),
+            std::time::Duration::from_millis(300),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("non ha risposto in tempo"),
+            "messaggio inatteso per un circuito lento: {err}"
+        );
     }
 
     #[test]
