@@ -418,24 +418,28 @@ details summary {
   margin: 0;
 }
 
-.write-layout {
+.recipients-row {
   display: flex;
-  gap: 1.5rem;
+  gap: 1rem;
   align-items: flex-start;
-  justify-content: center;
-  width: 100%;
 }
 
-/* Puramente decorativo (nessuna interazione, nessun dato reale): si
-   nasconde del tutto sotto una certa larghezza invece di andare a
-   capo, per non compromettere mai la leggibilita' del modulo. */
+.recipients-col {
+  flex: 1;
+  min-width: 0;
+}
+
+/* Puramente decorativo (nessuna interazione, nessun dato reale), nello
+   spazio libero accanto all'elenco destinatari: si nasconde del tutto
+   sotto una certa larghezza della finestra invece di schiacciare
+   quell'elenco, per non comprometterne mai la leggibilita'. */
 .write-decoration {
   flex-shrink: 0;
-  width: 200px;
-  margin-top: 2.75rem;
+  width: 150px;
+  margin-top: 1.6rem;
 }
 
-@media (max-width: 960px) {
+@media (max-width: 700px) {
   .write-decoration {
     display: none;
   }
