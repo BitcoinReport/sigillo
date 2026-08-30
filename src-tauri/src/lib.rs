@@ -161,6 +161,15 @@ fn identity_exists_on_disk(app: AppHandle) -> Result<bool, String> {
     Ok(storage::vault_exists(&vault_path(&app)?))
 }
 
+/// Versione dell'app (sincronizzata con il tag della release da parte
+/// del flusso di pubblicazione automatico): mostrata in Avanzate per
+/// poter verificare a colpo d'occhio quale versione è davvero
+/// installata, invece di doverlo dedurre da comportamenti/messaggi.
+#[tauri::command]
+fn app_version(app: AppHandle) -> String {
+    app.package_info().version.to_string()
+}
+
 #[tauri::command]
 fn generate_identity(
     state: State<AppState>,
@@ -516,16 +525,13 @@ const DEFAULT_TIMELOCK_ENDPOINT: &str = "https://mempool.space/api/blocks/tip/he
 // sono già ampiamente sufficienti anche con una rete lenta.
 const CLEARNET_HTTP_TIMEOUT_SECS: u64 = 20;
 
-// Un demone Tor "a freddo" (appena avviato, o comunque senza un
-// circuito già pronto) può impiegare anche svariate decine di secondi
-// per costruire un nuovo circuito alla prima richiesta: un Tor Browser
-// già aperto ha spesso circuiti pronti e risponde molto più in fretta,
-// ma non è corretto assumere che sia sempre così (es. un demone Tor
-// standalone lanciato da poco, come `tor`/Homebrew, senza un browser
-// aperto). Margini generosi per non scambiare per un errore quello che
-// è solo un circuito Tor lento a formarsi.
-const TOR_CONNECT_TIMEOUT_SECS: u64 = 60;
-const TOR_TOTAL_TIMEOUT_SECS: u64 = 90;
+// La costruzione di un circuito Tor è per natura variabile: nei test
+// di questa funzione, la stessa identica richiesta verso lo stesso
+// demone ha impiegato a volte pochi secondi e a volte oltre un minuto.
+// Margini generosi per non scambiare per un errore quello che è solo
+// un circuito lento a formarsi (l'utente può comunque ritentare).
+const TOR_CONNECT_TIMEOUT_SECS: u64 = 90;
+const TOR_TOTAL_TIMEOUT_SECS: u64 = 120;
 
 /// Interroga `endpoint` (che deve rispondere con l'altezza blocco come
 /// numero semplice, come fa l'API pubblica di mempool.space) e
@@ -570,6 +576,17 @@ fn fetch_block_height_with_timeouts(
     connect_timeout: std::time::Duration,
     total_timeout: std::time::Duration,
 ) -> Result<u32, String> {
+    // Log su stderr (visibile lanciando l'app da terminale, non
+    // incorporato in nessuna UI): pensato per poter diagnosticare un
+    // problema di connessione futuro senza dover indovinare quali
+    // valori sono stati effettivamente usati per la richiesta. Non
+    // c'e' alcuna cache in questa funzione: host, porta e client HTTP
+    // sono sempre ricostruiti da zero a ogni chiamata, con i valori
+    // ricevuti come parametro in quel preciso momento.
+    eprintln!(
+        "[sigillo/timelock] verifica altezza blocco: endpoint={endpoint} use_tor={use_tor} tor_socks={tor_socks_host}:{tor_socks_port} connect_timeout={connect_timeout:?} total_timeout={total_timeout:?}"
+    );
+
     let mut builder = reqwest::blocking::Client::builder().timeout(total_timeout);
 
     if use_tor {
@@ -587,6 +604,13 @@ fn fetch_block_height_with_timeouts(
         .map_err(|e| format!("impossibile inizializzare il client di rete: {e}"))?;
 
     let response = client.get(endpoint).send().map_err(|e| {
+        // {:?} (Debug) su un reqwest::Error espone anche la catena di
+        // errori sottostante (io::Error, motivo hyper...), utile in
+        // log/diagnosi anche quando il messaggio mostrato all'utente
+        // (via {}, Display) resta un riassunto piu' leggibile.
+        eprintln!(
+            "[sigillo/timelock] richiesta fallita verso {endpoint} (tor={use_tor}, proxy={tor_socks_host}:{tor_socks_port}): {e:?}"
+        );
         describe_block_height_request_error(&e, endpoint, use_tor, tor_socks_host, tor_socks_port)
     })?;
 
@@ -1404,6 +1428,7 @@ pub fn run() {
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
             identity_exists_on_disk,
+            app_version,
             generate_identity,
             import_identity,
             import_identity_external,
@@ -1562,12 +1587,15 @@ mod tests {
     // sono nettamente piu' generosi per il percorso Tor.
     #[test]
     fn tor_timeouts_are_generous_enough_for_a_cold_circuit() {
+        // Osservato empiricamente (vedi commento sulle costanti): la
+        // stessa richiesta, verso lo stesso demone, puo' impiegare da
+        // pochi secondi a oltre un minuto a seconda del momento.
         assert!(
-            TOR_CONNECT_TIMEOUT_SECS >= 45,
+            TOR_CONNECT_TIMEOUT_SECS >= 75,
             "il timeout di connessione per Tor e' di nuovo troppo aggressivo per un circuito a freddo"
         );
         assert!(
-            TOR_TOTAL_TIMEOUT_SECS >= 60,
+            TOR_TOTAL_TIMEOUT_SECS >= 100,
             "il timeout totale per Tor e' di nuovo troppo aggressivo per un circuito a freddo"
         );
     }

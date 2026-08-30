@@ -324,6 +324,9 @@
               <input id="timelock-target-height" type="text" inputmode="numeric" placeholder="Es. 900000" />
               <p id="timelock-current-height-hint" class="hint"></p>
               <p id="timelock-error" class="error" hidden></p>
+              <div class="button-row">
+                <button id="btn-retry-timelock-height" class="secondary" type="button" hidden>Riprova</button>
+              </div>
             </div>
           </div>
 
@@ -532,6 +535,7 @@
           Questa sezione contiene informazioni tecniche, utili solo se sai
           già cosa significano. Il resto dell'app non ne ha bisogno.
         </p>
+        <p class="hint">Versione di Sigillo: <span id="adv-app-version"></span></p>
 
         <h3>La mia chiave</h3>
         <label>Fingerprint completo (esadecimale)</label>

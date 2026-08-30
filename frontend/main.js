@@ -1022,23 +1022,37 @@ document.getElementById("sign-message").addEventListener(
   { once: true }
 );
 
-document.getElementById("timelock-toggle").addEventListener("change", async (e) => {
-  const enabled = e.target.checked;
-  document.getElementById("timelock-fields").hidden = !enabled;
-  setError("timelock-error", null);
-  if (!enabled) return;
-
+async function checkCurrentBlockHeightForTimelock(button) {
   const hint = document.getElementById("timelock-current-height-hint");
+  const retryBtn = document.getElementById("btn-retry-timelock-height");
+  setError("timelock-error", null);
+  retryBtn.hidden = true;
   hint.textContent = torSettings.enabled
-    ? "Verifica dell'altezza attuale tramite Tor... può richiedere fino a un minuto, soprattutto la prima volta."
+    ? "Verifica dell'altezza attuale tramite Tor... la costruzione di un circuito può richiedere anche oltre un minuto, specialmente la prima volta."
     : "Verifica dell'altezza attuale...";
   try {
-    const current = await invoke("check_block_height", { customEndpoint: torSettings.customEndpoint });
+    const current = await withLoading(button, () =>
+      invoke("check_block_height", { customEndpoint: torSettings.customEndpoint })
+    );
     hint.textContent = `Altezza blocco attuale: ${current.toLocaleString("it-IT")} (circa 10 minuti per blocco).`;
   } catch (err) {
     hint.textContent = "";
     setError("timelock-error", `Impossibile verificare l'altezza attuale: ${err}`);
+    retryBtn.hidden = false;
   }
+}
+
+document.getElementById("timelock-toggle").addEventListener("change", async (e) => {
+  const enabled = e.target.checked;
+  document.getElementById("timelock-fields").hidden = !enabled;
+  setError("timelock-error", null);
+  document.getElementById("btn-retry-timelock-height").hidden = true;
+  if (!enabled) return;
+  await checkCurrentBlockHeightForTimelock(null);
+});
+
+document.getElementById("btn-retry-timelock-height").addEventListener("click", async (e) => {
+  await checkCurrentBlockHeightForTimelock(e.currentTarget);
 });
 
 document.getElementById("btn-encrypt").addEventListener("click", async (e) => {
@@ -1475,6 +1489,12 @@ function renderTechDetail(container, detail) {
 
 async function populateAdvancedScreen() {
   renderExperimentalFeaturesUi();
+
+  try {
+    document.getElementById("adv-app-version").textContent = await invoke("app_version");
+  } catch {
+    document.getElementById("adv-app-version").textContent = "sconosciuta";
+  }
 
   document.getElementById("adv-my-fingerprint-hex").textContent =
     identities[activeIdentityIndex] ? identities[activeIdentityIndex].fingerprintHex : "";
