@@ -1031,6 +1031,11 @@ fn detect_media_mime(data: &[u8]) -> Option<&'static str> {
     if data.starts_with(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) {
         return Some("image/png");
     }
+    // GIF (sia la variante storica "87a" sia "89a", quella con
+    // animazione): la mostra un normale tag <img>, che anima da solo.
+    if data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a") {
+        return Some("image/gif");
+    }
     if data.len() > 12 && &data[4..8] == b"ftyp" {
         let brand = &data[8..12];
         if matches!(
@@ -1416,8 +1421,54 @@ fn decrypt_file(
     ))
 }
 
+/// Su Linux la webview è WebKitGTK, che per riprodurre un video (anteprima
+/// di un .mp4/.mov decifrato) si appoggia a GStreamer. Su diverse GPU più
+/// datate il percorso di decodifica video *hardware* via VA-API è rotto a
+/// livello di driver — sul chip Intel Haswell di prova, per esempio, il
+/// driver i965 fallisce un'asserzione interna sul sottocampionamento e
+/// l'allocatore dmabuf VA segnala "driver bug" — e questo può far
+/// terminare l'intero processo della webview: la finestra diventa bianca
+/// e non arriva nessun errore gestibile a livello applicativo (è il
+/// sintomo esatto segnalato su Linux Mint e su CubeOS/Qubes).
+///
+/// Per evitarlo forziamo la decodifica video *software*: demotiamo a
+/// `NONE` gli elementi decoder/post-process VA-API di GStreamer, così la
+/// scelta ricade sempre sul decoder software (`avdec_h264` e simili). Non
+/// tocchiamo il resto dell'accelerazione (compositing, WebGL, immagini):
+/// per i video brevi tipici di un messaggio il costo della decodifica
+/// software è trascurabile, e in cambio non si crasha su configurazioni
+/// Linux che non possiamo testare una per una. Chi sa di avere una
+/// VA-API funzionante può annullare questa scelta impostando da sé la
+/// variabile `GST_PLUGIN_FEATURE_RANK` prima di avviare Sigillo.
+#[cfg(target_os = "linux")]
+fn force_software_video_decoding() {
+    if std::env::var_os("GST_PLUGIN_FEATURE_RANK").is_some() {
+        // L'utente (o l'ambiente) l'ha già impostata: non la sovrascriviamo.
+        return;
+    }
+    std::env::set_var(
+        "GST_PLUGIN_FEATURE_RANK",
+        "vah264dec:NONE,vah265dec:NONE,vah264lpdec:NONE,vah265lpdec:NONE,\
+         vavp8dec:NONE,vavp9dec:NONE,vaav1dec:NONE,vampeg2dec:NONE,vapostproc:NONE,\
+         vaapih264dec:NONE,vaapih265dec:NONE,vaapivp8dec:NONE,vaapivp9dec:NONE,\
+         vaapiav1dec:NONE,vaapimpeg2dec:NONE,vaapipostproc:NONE,vaapidecodebin:NONE",
+    );
+    eprintln!(
+        "[sigillo] Linux: decodifica video hardware (VA-API) disattivata nella webview, \
+         si userà la decodifica software (imposta GST_PLUGIN_FEATURE_RANK per annullare)"
+    );
+}
+
+#[cfg(not(target_os = "linux"))]
+fn force_software_video_decoding() {}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Va fatto prima che WebKitGTK/GStreamer vengano inizializzati (cioè
+    // prima di costruire la webview): a quel punto la variabile è già nel
+    // processo e viene letta durante la scansione del registry di GStreamer.
+    force_software_video_decoding();
+
     cleanup_stale_temp_previews();
 
     tauri::Builder::default()
@@ -1690,6 +1741,22 @@ mod tests {
             detect_media_mime(&[0xFF, 0xD8, 0xFF, 0, 0]),
             Some("image/jpeg")
         );
+    }
+
+    #[test]
+    fn detects_gif_both_87a_and_89a() {
+        let mut old = b"GIF87a".to_vec();
+        old.extend_from_slice(&[0u8; 16]);
+        assert_eq!(detect_media_mime(&old), Some("image/gif"));
+
+        let mut animated = b"GIF89a".to_vec();
+        animated.extend_from_slice(&[0u8; 16]);
+        assert_eq!(detect_media_mime(&animated), Some("image/gif"));
+    }
+
+    #[test]
+    fn text_starting_like_gif_but_not_a_gif_is_not_detected() {
+        assert_eq!(detect_media_mime(b"GIF ma non davvero"), None);
     }
 
     #[test]
