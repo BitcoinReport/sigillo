@@ -123,6 +123,19 @@ function base64ToBytes(base64) {
 // modo su ogni piattaforma.
 const UNSUPPORTED_PREVIEW_MIMES = new Set(["image/heic", "image/heif"]);
 
+// Su Linux la webview è WebKitGTK, che riproduce i video appoggiandosi a
+// GStreamer: su diverse combinazioni di driver/plugin di sistema (VA-API
+// difettosa, plugin mancanti...) la costruzione della pipeline di
+// riproduzione può terminare l'intero processo della webview — schermo
+// bianco, nessun errore intercettabile da JavaScript. Il rischio non
+// vale un'anteprima: su Linux i video decifrati (e quelli allegati in
+// "Scrivi") non vengono mostrati in un <video>, si offre invece di
+// salvarli/aprirli con il lettore del sistema. Su macOS e Windows
+// l'anteprima inline resta invariata.
+const INLINE_VIDEO_PREVIEW_SUPPORTED = !/\bLinux\b/i.test(
+  (typeof navigator !== "undefined" && navigator.userAgent) || ""
+);
+
 // Ridimensiona un'immagine (bytes grezzi) a un lato massimo di
 // `maxDim` pixel e la restituisce come coppia { base64, mime }, pronta
 // per essere salvata nella rubrica come foto profilo: evita di
@@ -513,7 +526,12 @@ async function setAttachedImage(path) {
       return;
     }
     attachedImagePreviewUrl = URL.createObjectURL(new Blob([bytes], { type: mime }));
-    if (isVideo) {
+    if (isVideo && !INLINE_VIDEO_PREVIEW_SUPPORTED) {
+      // Su Linux niente anteprima video inline (vedi
+      // INLINE_VIDEO_PREVIEW_SUPPORTED): il file verrà comunque cifrato
+      // leggendolo direttamente dal disco.
+      unsupported.hidden = false;
+    } else if (isVideo) {
       // Se la webview non riesce a mostrare l'anteprima del video su
       // questo sistema, non è un problema: il file verrà cifrato
       // leggendolo direttamente dal disco. Mostriamo solo l'avviso.
@@ -1277,15 +1295,16 @@ function showDecryptedMedia(result) {
   lastDecrypted = { bytes: base64ToBytes(result.image_data_base64), filename: result.filename };
 
   if (isVideo) {
-    // Se questo sistema non riesce a decodificare/mostrare il video
-    // nell'anteprima (driver video difettoso, formato non gestito dalla
-    // webview...), non deve succedere niente di peggio di un messaggio
-    // chiaro: il file è già stato decifrato e il pulsante "Salva..."
-    // qui sotto continua a funzionare, perché lastDecrypted è già
-    // impostato qui sopra. (Il crash vero e proprio del processo webview
-    // per la decodifica hardware VA-API su Linux è invece prevenuto a
-    // monte, forzando la decodifica software: vedi force_software_video_decoding
-    // nel backend.)
+    // Il file è già stato decifrato: lastDecrypted è impostato qui sopra,
+    // quindi il pulsante "Salva..." nella riga sotto funziona comunque.
+    if (!INLINE_VIDEO_PREVIEW_SUPPORTED) {
+      // Su Linux non si tenta l'anteprima inline (vedi
+      // INLINE_VIDEO_PREVIEW_SUPPORTED): si mostra solo l'avviso.
+      videoUnsupported.hidden = false;
+      return;
+    }
+    // macOS/Windows: anteprima inline, con rete di sicurezza se il
+    // sistema non riesce comunque a decodificare/mostrare il video.
     video.onerror = () => {
       video.pause();
       video.removeAttribute("src");
