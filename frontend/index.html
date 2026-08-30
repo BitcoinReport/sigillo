@@ -279,10 +279,10 @@
           <label for="message-text">Messaggio (facoltativo se alleghi un'immagine)</label>
           <textarea id="message-text" rows="8" placeholder="Scrivi qui il tuo messaggio..."></textarea>
 
-          <label>Immagine o video (facoltativo)</label>
+          <label>Immagine, GIF o video (facoltativo)</label>
           <div id="image-dropzone" class="dropzone">
             <div id="image-dropzone-prompt">
-              <p class="hint">Trascina qui una foto o un video (JPG, PNG, HEIC, MOV o MP4), oppure</p>
+              <p class="hint">Trascina qui una foto, una GIF o un video (JPG, PNG, GIF, HEIC, MOV o MP4), oppure</p>
               <button id="btn-choose-image" class="secondary" type="button">Scegli file...</button>
             </div>
             <div id="image-preview-wrap" hidden>
@@ -377,6 +377,11 @@
                 Non riesco a mostrare l'anteprima di questo formato, ma
                 puoi comunque salvare il file.
               </p>
+              <p id="decrypt-video-unsupported" class="hint" hidden>
+                Impossibile visualizzare l'anteprima video su questo
+                sistema, ma il file è stato decifrato correttamente —
+                puoi comunque salvarlo.
+              </p>
               <div id="decrypt-media-large" hidden>
                 <p class="hint">
                   File di grandi dimensioni (<span id="decrypt-media-large-name"></span>):
@@ -411,6 +416,18 @@
               <p id="timelocked-error" class="hint" hidden></p>
               <div class="button-row">
                 <button id="btn-recheck-timelock" class="secondary">Controlla di nuovo</button>
+              </div>
+            </div>
+
+            <div id="decrypt-result-render-error" hidden>
+              <p class="warning">
+                Il messaggio è stato decifrato correttamente, ma non è
+                stato possibile mostrarne il contenuto su questo sistema.
+                Se hai avviato Sigillo da terminale, il testo eventuale è
+                stato scritto lì.
+              </p>
+              <div class="button-row">
+                <button id="decrypt-render-error-save" class="secondary" hidden>Salva il file decifrato...</button>
               </div>
             </div>
           </div>

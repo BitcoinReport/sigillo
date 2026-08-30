@@ -72,6 +72,7 @@ const IMAGE_MIME_BY_EXTENSION = {
   jpg: "image/jpeg",
   jpeg: "image/jpeg",
   png: "image/png",
+  gif: "image/gif",
   heic: "image/heic",
   heif: "image/heif",
 };
@@ -121,6 +122,19 @@ function base64ToBytes(base64) {
 // caricamento sperando che l'evento "error" scatti sempre allo stesso
 // modo su ogni piattaforma.
 const UNSUPPORTED_PREVIEW_MIMES = new Set(["image/heic", "image/heif"]);
+
+// Su Linux la webview è WebKitGTK, che riproduce i video appoggiandosi a
+// GStreamer: su diverse combinazioni di driver/plugin di sistema (VA-API
+// difettosa, plugin mancanti...) la costruzione della pipeline di
+// riproduzione può terminare l'intero processo della webview — schermo
+// bianco, nessun errore intercettabile da JavaScript. Il rischio non
+// vale un'anteprima: su Linux i video decifrati (e quelli allegati in
+// "Scrivi") non vengono mostrati in un <video>, si offre invece di
+// salvarli/aprirli con il lettore del sistema. Su macOS e Windows
+// l'anteprima inline resta invariata.
+const INLINE_VIDEO_PREVIEW_SUPPORTED = !/\bLinux\b/i.test(
+  (typeof navigator !== "undefined" && navigator.userAgent) || ""
+);
 
 // Ridimensiona un'immagine (bytes grezzi) a un lato massimo di
 // `maxDim` pixel e la restituisce come coppia { base64, mime }, pronta
@@ -459,7 +473,7 @@ async function setAttachedImage(path) {
   if (!mime) {
     setError(
       "encrypt-error",
-      "Formato non supportato: usa un'immagine (JPG, PNG, HEIC) o un video (MOV, MP4)."
+      "Formato non supportato: usa un'immagine (JPG, PNG, GIF, HEIC) o un video (MOV, MP4)."
     );
     return;
   }
@@ -512,7 +526,21 @@ async function setAttachedImage(path) {
       return;
     }
     attachedImagePreviewUrl = URL.createObjectURL(new Blob([bytes], { type: mime }));
-    if (isVideo) {
+    if (isVideo && !INLINE_VIDEO_PREVIEW_SUPPORTED) {
+      // Su Linux niente anteprima video inline (vedi
+      // INLINE_VIDEO_PREVIEW_SUPPORTED): il file verrà comunque cifrato
+      // leggendolo direttamente dal disco.
+      unsupported.hidden = false;
+    } else if (isVideo) {
+      // Se la webview non riesce a mostrare l'anteprima del video su
+      // questo sistema, non è un problema: il file verrà cifrato
+      // leggendolo direttamente dal disco. Mostriamo solo l'avviso.
+      video.onerror = () => {
+        video.pause();
+        video.removeAttribute("src");
+        video.hidden = true;
+        unsupported.hidden = false;
+      };
       video.src = attachedImagePreviewUrl;
       video.hidden = false;
     } else {
@@ -543,7 +571,9 @@ function clearAttachedImage() {
   const video = document.getElementById("attach-video-preview");
   video.pause();
   video.removeAttribute("src");
+  video.onerror = null;
   video.hidden = true;
+  document.getElementById("image-preview-unsupported").hidden = true;
   document.getElementById("attach-media-toolarge-hint").hidden = true;
   document.getElementById("image-preview-wrap").hidden = true;
   document.getElementById("image-dropzone-prompt").hidden = false;
@@ -553,7 +583,10 @@ document.getElementById("btn-choose-image").addEventListener("click", async () =
   const path = await open({
     multiple: false,
     filters: [
-      { name: "Immagini e video", extensions: ["jpg", "jpeg", "png", "heic", "heif", "mov", "mp4"] },
+      {
+        name: "Immagini e video",
+        extensions: ["jpg", "jpeg", "png", "gif", "heic", "heif", "mov", "mp4"],
+      },
     ],
   });
   if (path) await setAttachedImage(path);
@@ -1235,6 +1268,7 @@ function showDecryptedMedia(result) {
   const img = document.getElementById("decrypt-image-preview");
   const video = document.getElementById("decrypt-video-preview");
   const unsupported = document.getElementById("decrypt-image-unsupported");
+  const videoUnsupported = document.getElementById("decrypt-video-unsupported");
   const largeBlock = document.getElementById("decrypt-media-large");
   const isVideo = (result.image_mime || "").startsWith("video/");
 
@@ -1242,8 +1276,10 @@ function showDecryptedMedia(result) {
   img.src = "";
   video.pause();
   video.removeAttribute("src");
+  video.onerror = null;
   video.hidden = true;
   unsupported.hidden = true;
+  videoUnsupported.hidden = true;
   largeBlock.hidden = true;
 
   if (result.media_temp_path) {
@@ -1259,6 +1295,22 @@ function showDecryptedMedia(result) {
   lastDecrypted = { bytes: base64ToBytes(result.image_data_base64), filename: result.filename };
 
   if (isVideo) {
+    // Il file è già stato decifrato: lastDecrypted è impostato qui sopra,
+    // quindi il pulsante "Salva..." nella riga sotto funziona comunque.
+    if (!INLINE_VIDEO_PREVIEW_SUPPORTED) {
+      // Su Linux non si tenta l'anteprima inline (vedi
+      // INLINE_VIDEO_PREVIEW_SUPPORTED): si mostra solo l'avviso.
+      videoUnsupported.hidden = false;
+      return;
+    }
+    // macOS/Windows: anteprima inline, con rete di sicurezza se il
+    // sistema non riesce comunque a decodificare/mostrare il video.
+    video.onerror = () => {
+      video.pause();
+      video.removeAttribute("src");
+      video.hidden = true;
+      videoUnsupported.hidden = false;
+    };
     video.src = `data:${result.image_mime};base64,${result.image_data_base64}`;
     video.hidden = false;
     return;
@@ -1332,27 +1384,74 @@ function renderDecryptResult(result) {
   const imageBlock = document.getElementById("decrypt-result-image");
   const fileBlock = document.getElementById("decrypt-result-file");
   const timelockedBlock = document.getElementById("decrypt-result-timelocked");
+  const renderErrorBlock = document.getElementById("decrypt-result-render-error");
   textBlock.hidden = true;
   imageBlock.hidden = true;
   fileBlock.hidden = true;
   timelockedBlock.hidden = true;
+  renderErrorBlock.hidden = true;
 
-  if (result.kind === "bloccato_nel_tempo") {
-    renderTimelockedResult(result);
-    timelockedBlock.hidden = false;
-  } else if (result.kind === "testo") {
-    document.getElementById("plaintext-out").value = result.plaintext;
-    textBlock.hidden = false;
-  } else if (result.kind === "immagine" || result.kind === "video" || result.kind === "combinato") {
-    if (result.kind === "combinato") {
+  // Il contenuto è già stato decifrato correttamente a questo punto: qui
+  // si tratta solo di *mostrarlo*. Se il rendering fallisce per una
+  // incompatibilità della webview su questo sistema (è successo con i
+  // video su Linux e con il testo su CubeOS/Qubes), non deve trascinarsi
+  // dietro l'intera schermata: mostriamo un avviso leggibile e, quando
+  // possibile, lasciamo comunque salvare il file. Nota: questo intercetta
+  // solo gli errori JS sincroni; un crash del processo webview va
+  // prevenuto a monte (vedi force_software_video_decoding nel backend).
+  try {
+    if (result.kind === "bloccato_nel_tempo") {
+      renderTimelockedResult(result);
+      timelockedBlock.hidden = false;
+    } else if (result.kind === "testo") {
       document.getElementById("plaintext-out").value = result.plaintext;
       textBlock.hidden = false;
+    } else if (
+      result.kind === "immagine" ||
+      result.kind === "video" ||
+      result.kind === "combinato"
+    ) {
+      if (result.kind === "combinato") {
+        document.getElementById("plaintext-out").value = result.plaintext;
+        textBlock.hidden = false;
+      }
+      showDecryptedMedia(result);
+      imageBlock.hidden = false;
+    } else {
+      lastDecrypted = { bytes: base64ToBytes(result.image_data_base64), filename: result.filename };
+      fileBlock.hidden = false;
     }
-    showDecryptedMedia(result);
-    imageBlock.hidden = false;
-  } else {
-    lastDecrypted = { bytes: base64ToBytes(result.image_data_base64), filename: result.filename };
-    fileBlock.hidden = false;
+  } catch (err) {
+    // Fallback: teniamo comunque pronto il salvataggio se abbiamo i byte,
+    // e — per il testo — lo stampiamo su stderr (visibile lanciando
+    // l'app da terminale) così non è del tutto irraggiungibile.
+    console.error("Errore nel mostrare il contenuto decifrato:", err);
+    if (typeof result.plaintext === "string" && result.plaintext.length > 0) {
+      console.error("Testo decifrato (non mostrato a schermo):\n" + result.plaintext);
+    }
+    if (!lastDecrypted && result.image_data_base64) {
+      try {
+        lastDecrypted = {
+          bytes: base64ToBytes(result.image_data_base64),
+          filename: result.filename,
+        };
+      } catch (_) {
+        /* niente byte salvabili: pazienza, resta solo l'avviso */
+      }
+    }
+    // Se era un messaggio combinato e la didascalia era già stata
+    // scritta prima del punto di rottura, la lasciamo visibile: a non
+    // essersi potuto mostrare è solo l'allegato.
+    const keepText =
+      result.kind === "combinato" &&
+      typeof result.plaintext === "string" &&
+      document.getElementById("plaintext-out").value === result.plaintext;
+    textBlock.hidden = !keepText;
+    imageBlock.hidden = true;
+    fileBlock.hidden = true;
+    timelockedBlock.hidden = true;
+    document.getElementById("decrypt-render-error-save").hidden = !lastDecrypted;
+    renderErrorBlock.hidden = false;
   }
 
   document.getElementById("decrypt-result").hidden = false;
@@ -1435,6 +1534,10 @@ document.getElementById("btn-save-decrypted-image").addEventListener("click", ()
 });
 
 document.getElementById("btn-save-decrypted-file").addEventListener("click", () => {
+  saveLastDecrypted("file-decifrato");
+});
+
+document.getElementById("decrypt-render-error-save").addEventListener("click", () => {
   saveLastDecrypted("file-decifrato");
 });
 
