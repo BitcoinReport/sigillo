@@ -651,12 +651,16 @@ fn describe_block_height_request_error(
         format!(
             "il proxy Tor su {tor_socks_host}:{tor_socks_port} non ha risposto in tempo: se il client Tor è stato avviato da poco, il circuito potrebbe impiegare più tempo del solito a formarsi la prima volta. Riprova tra qualche istante."
         )
-    } else if err.is_connect() {
+    } else {
+        // Qualunque altro errore sul percorso Tor (rifiuto di connessione
+        // al proxy, tunnel SOCKS non stabilito, circuito fallito...): la
+        // classificazione fine di reqwest non è portabile — un rifiuto
+        // verso il proxy risulta `is_connect()` su Unix ma non su Windows
+        // — mentre l'indicazione utile per l'utente è la stessa in tutti
+        // questi casi. Il motivo tecnico preciso resta in "Dettagli".
         format!(
             "impossibile connettersi al proxy Tor su {tor_socks_host}:{tor_socks_port}: verifica che un client Tor (demone standalone, Tor Browser...) sia davvero in ascolto su quella porta. Dettagli: {err}"
         )
-    } else {
-        format!("impossibile raggiungere {endpoint} tramite Tor ({tor_socks_host}:{tor_socks_port}): {err}")
     }
 }
 
