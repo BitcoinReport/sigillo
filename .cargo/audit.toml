@@ -1,0 +1,16 @@
+# Configurazione per `cargo audit` (eseguito in CI, vedi
+# .github/workflows/build.yml). Serve a NON far fallire la CI su
+# vulnerabilità già note e in corso di gestione, continuando però a
+# bloccare tutto ciò che comparirà di nuovo da qui in avanti.
+
+[advisories]
+ignore = [
+    # sequoia-openpgp 1.22: underflow in aes_key_unwrap -> panic/DoS se si
+    # apre un messaggio con un pacchetto PKESK/SKESK volutamente malformato.
+    # Nessuna perdita di chiavi né decifratura errata. Risolto in
+    # sequoia-openpgp >= 2.1, che è un cambio di versione MAJOR e tocca
+    # tutte le chiamate crypto di sigillo-core: va fatto in una PR dedicata
+    # con ri-test end-to-end completo. Tracciato qui nel frattempo.
+    # https://rustsec.org/advisories/RUSTSEC-2025-0136
+    "RUSTSEC-2025-0136",
+]

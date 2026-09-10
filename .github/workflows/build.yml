@@ -65,8 +65,8 @@ jobs:
       - name: Installa le dipendenze npm
         run: npm ci
 
-      - name: Esegui i test del core crittografico
-        run: cargo test -p sigillo-core
+      - name: Esegui i test (core crittografico + comandi dell'app)
+        run: cargo test --workspace
 
       - name: Build del pacchetto Sigillo (${{ matrix.name }})
         run: npm run tauri build
@@ -86,3 +86,16 @@ jobs:
             target/release/bundle/**/*.msi
             target/release/bundle/**/*.exe
           if-no-files-found: error
+
+  # Controlla le dipendenze Rust contro il database RustSec (advisory di
+  # sicurezza note). Le eccezioni già valutate stanno in .cargo/audit.toml;
+  # qualunque advisory nuovo fa fallire questo job.
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - run: cargo audit

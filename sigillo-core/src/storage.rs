@@ -36,10 +36,19 @@ const MAGIC_V2: &[u8; 4] = b"SGL2";
 const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 12;
 
-// Argon2id, parametri in linea con le raccomandazioni OWASP per uso
-// interattivo (circa 19 MiB di memoria, giusto per rendere costoso un
-// attacco a forza bruta senza rendere fastidiosa l'attesa di sblocco).
-const ARGON2_M_COST: u32 = 19_456;
+// Argon2id. Questi parametri proteggono l'unico segreto a riposo sul
+// dispositivo (la seed phrase / chiave privata nel vault): teniamo la
+// memoria a 64 MiB, ben oltre il minimo OWASP di ~19 MiB, perché il
+// costo in più allo sblocco è di pochi centesimi di secondo mentre
+// quello di un attacco a forza bruta offline su un file rubato sale
+// in modo sensibile.
+//
+// I parametri vengono scritti dentro il file del vault e riletti da lì
+// allo sblocco (vedi save_vault / load_vault_v*): un vault salvato con
+// valori precedenti continua quindi a sbloccarsi con quei valori, e
+// passa a questi nuovi solo alla prima riscrittura (es. aggiunta o
+// rimozione di un'identità).
+const ARGON2_M_COST: u32 = 65_536;
 const ARGON2_T_COST: u32 = 2;
 const ARGON2_P_COST: u32 = 1;
 
@@ -457,5 +466,57 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].alias, "Alice");
         assert_eq!(entries[0].source, EntrySource::Seed("parola1 parola2 parola3".to_string()));
+    }
+
+    #[test]
+    fn a_vault_saved_with_older_argon2_parameters_still_unlocks() {
+        // I parametri Argon2 sono salvati nel file e riletti da lì: se in
+        // una versione futura alziamo ARGON2_M_COST, un vault scritto con
+        // il valore precedente deve continuare a sbloccarsi (nessuno
+        // resta fuori dalla propria identità dopo un aggiornamento).
+        // Qui ricostruiamo a mano un vault V2 con m_cost = 19_456 (il
+        // valore storico) e verifichiamo che load_vault lo apra.
+        const OLD_M_COST: u32 = 19_456;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity.sigillo");
+        let passphrase = "passphrase-di-un-vault-vecchio";
+
+        let mut salt = [0u8; SALT_LEN];
+        rand::rngs::OsRng.fill_bytes(&mut salt);
+        let key = derive_key(passphrase, &salt, OLD_M_COST, ARGON2_T_COST, ARGON2_P_COST).unwrap();
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key.as_slice()));
+
+        let entry = VaultEntry {
+            alias: "Bea".to_string(),
+            source: EntrySource::Seed("una due tre quattro".to_string()),
+        };
+
+        let mut nonce_bytes = [0u8; NONCE_LEN];
+        rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
+        let ciphertext = cipher
+            .encrypt(Nonce::from_slice(&nonce_bytes), encode_entry(&entry).as_slice())
+            .unwrap();
+
+        let mut out = Vec::new();
+        out.extend_from_slice(MAGIC_V2);
+        out.push(SALT_LEN as u8);
+        out.extend_from_slice(&salt);
+        out.extend_from_slice(&OLD_M_COST.to_le_bytes());
+        out.extend_from_slice(&ARGON2_T_COST.to_le_bytes());
+        out.extend_from_slice(&ARGON2_P_COST.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes()); // una voce
+        out.extend_from_slice(&nonce_bytes);
+        out.extend_from_slice(&(ciphertext.len() as u32).to_le_bytes());
+        out.extend_from_slice(&ciphertext);
+        fs::write(&path, &out).unwrap();
+
+        let entries = load_vault(&path, passphrase).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].alias, "Bea");
+        assert_eq!(
+            entries[0].source,
+            EntrySource::Seed("una due tre quattro".to_string())
+        );
     }
 }
