@@ -671,6 +671,64 @@ fn should_use_tor(endpoint: &str, local_tor_enabled: bool) -> bool {
     endpoint.contains(".onion") || local_tor_enabled
 }
 
+/// L'endpoint di verifica altezza blocco che compare *dentro* un
+/// messaggio con blocco temporale è scelto da chi ha scritto il
+/// messaggio, non da chi lo apre. Prima di contattarlo lo restringiamo,
+/// così che aprire un messaggio non possa diventare:
+///
+/// - un "tracking pixel": una richiesta in chiaro rivelerebbe al
+///   mittente IP e orario esatto di apertura → ammettiamo solo `https`
+///   (con un'eccezione per gli indirizzi `.onion`, dove è il trasporto
+///   Tor a fornire cifratura e anonimato e i servizi onion sono spesso
+///   solo-`http`);
+/// - un SSRF verso la rete interna del destinatario → l'host deve essere
+///   un nome di dominio, mai un indirizzo IP scritto per esteso (blocca
+///   `127.0.0.1`, `169.254.169.254`, `10.x`, `192.168.x`, `[::1]`, ...),
+///   e non deve essere `localhost`.
+///
+/// L'endpoint predefinito (mempool.space) e quello eventualmente salvato
+/// dall'utente in Avanzate non passano di qui: quelli li ha scelti
+/// l'utente in prima persona.
+fn validate_sender_supplied_endpoint(raw: &str) -> Result<(), String> {
+    let generic = || {
+        "l'indirizzo di verifica indicato nel messaggio non è ammesso \
+         (serve un URL https verso un nome di dominio)"
+            .to_string()
+    };
+
+    let url = reqwest::Url::parse(raw).map_err(|_| generic())?;
+
+    let host = url.host_str().ok_or_else(generic)?;
+    // host_str() restituisce l'IPv6 fra parentesi quadre: vanno tolte
+    // prima di provare a interpretarlo come indirizzo IP.
+    let host_bare = host.trim_start_matches('[').trim_end_matches(']');
+    let host_lower = host_bare.to_ascii_lowercase();
+
+    let is_onion = host_lower == "onion" || host_lower.ends_with(".onion");
+
+    match url.scheme() {
+        "https" => {}
+        "http" if is_onion => {}
+        _ => return Err(generic()),
+    }
+
+    if host_bare.parse::<std::net::IpAddr>().is_ok() {
+        return Err(
+            "l'indirizzo di verifica indicato nel messaggio punta a un IP diretto, non consentito"
+                .to_string(),
+        );
+    }
+
+    if host_lower == "localhost" || host_lower.ends_with(".localhost") {
+        return Err(
+            "l'indirizzo di verifica indicato nel messaggio punta a 'localhost', non consentito"
+                .to_string(),
+        );
+    }
+
+    Ok(())
+}
+
 /// Controlla l'altezza blocco corrente: usato sia per mostrare un
 /// riferimento mentre si sceglie l'altezza target in Scrivi, sia
 /// internamente per verificare se un messaggio bloccato si può ormai
@@ -1176,8 +1234,45 @@ fn build_decrypt_view(
         message::SignatureStatus::Unverifiable => ("non_verificabile".to_string(), None),
     };
 
-    if sigillo_core::timelock::is_timelocked(&data) {
+    // Il blocco temporale è una funzione *sperimentale*: finché l'utente
+    // non l'ha attivata esplicitamente (default: spenta), un messaggio
+    // marcato come "bloccato nel tempo" NON deve essere processato come
+    // tale — in particolare non deve far partire la verifica dell'altezza
+    // blocco, che è una richiesta di rete verso un endpoint indicato
+    // *dentro* il messaggio dal mittente. Senza questo controllo, aprire
+    // un messaggio ostile equivarrebbe a un "tracking pixel" (rivela IP e
+    // orario di apertura a chi l'ha mandato) e a un possibile SSRF verso
+    // risorse di rete interne, del tutto all'insaputa di chi non ha mai
+    // toccato le funzioni sperimentali. A feature spenta lo trattiamo
+    // quindi come un dato binario opaco (salvabile come file).
+    if settings.experimental_features_enabled && sigillo_core::timelock::is_timelocked(&data) {
         if let Ok(locked) = sigillo_core::timelock::decode(&data) {
+            // Un endpoint incluso nel messaggio è scelto dal mittente, non
+            // da chi riceve: prima di contattarlo va ristretto (solo https,
+            // niente IP letterali o localhost — vedi la funzione).
+            if let Some(sender_endpoint) = locked
+                .endpoint
+                .as_deref()
+                .map(str::trim)
+                .filter(|e| !e.is_empty())
+            {
+                if let Err(why) = validate_sender_supplied_endpoint(sender_endpoint) {
+                    return DecryptView {
+                        kind: "bloccato_nel_tempo".to_string(),
+                        plaintext: None,
+                        image_data_base64: None,
+                        image_mime: None,
+                        media_temp_path: None,
+                        filename,
+                        signature_status,
+                        signer_fingerprint,
+                        target_height: Some(locked.target_height),
+                        current_height: None,
+                        height_check_error: Some(why),
+                    };
+                }
+            }
+
             let endpoint = effective_endpoint(locked.endpoint.as_deref());
             let use_tor = should_use_tor(&endpoint, settings.tor_enabled);
             match fetch_block_height(&endpoint, use_tor, &settings.tor_socks_host, settings.tor_socks_port) {
@@ -1651,6 +1746,12 @@ mod tests {
         );
     }
 
+    // Solo Unix: verso una porta di loopback chiusa, Unix risponde con un
+    // rifiuto immediato (ECONNREFUSED -> reqwest is_connect()), mentre
+    // Windows lascia scadere il connect_timeout e lo classifica come
+    // TimedOut (is_timeout()). Su Windows quello scenario non è più un
+    // "rifiuto" distinguibile da un timeout, quindi il test non si applica.
+    #[cfg(unix)]
     #[test]
     fn fetch_block_height_reports_connect_refused_through_tor_distinctly() {
         // Nessun proxy in ascolto su questa porta: deve dire chiaramente
@@ -1707,6 +1808,105 @@ mod tests {
             err.contains("non ha risposto in tempo"),
             "messaggio inatteso per un circuito lento: {err}"
         );
+    }
+
+    // ---------- Time-lock: privacy / SSRF alla decifratura ----------
+
+    fn settings_with_experimental(enabled: bool) -> settings::Settings {
+        let mut s = settings::Settings::default();
+        s.experimental_features_enabled = enabled;
+        s
+    }
+
+    /// Il bug: un messaggio marcato come "bloccato nel tempo" faceva
+    /// partire una richiesta di rete (verso un endpoint scelto dal
+    /// mittente) al solo aprirlo, ANCHE se l'utente non aveva mai
+    /// attivato le funzioni sperimentali. A feature spenta il messaggio
+    /// deve invece essere trattato come dato opaco, senza toccare la rete.
+    #[test]
+    fn timelocked_message_is_inert_when_experimental_features_are_off() {
+        // Endpoint volutamente "cattivo" (metadati cloud): se il gate non
+        // funzionasse, questo test proverebbe a contattarlo.
+        let blob = sigillo_core::timelock::encode(
+            10_000_000,
+            Some("http://169.254.169.254/latest/meta-data/"),
+            b"contenuto interno del messaggio bloccato",
+        );
+
+        let view = build_decrypt_view(
+            blob,
+            None,
+            message::SignatureStatus::Unsigned,
+            &settings_with_experimental(false),
+        );
+
+        assert_ne!(
+            view.kind, "bloccato_nel_tempo",
+            "a funzioni sperimentali spente il messaggio non deve essere processato come time-lock"
+        );
+        assert_eq!(view.kind, "file", "va mostrato come dato grezzo salvabile");
+        assert!(view.target_height.is_none());
+        assert!(view.current_height.is_none());
+        assert!(view.height_check_error.is_none());
+    }
+
+    /// A feature attiva, un endpoint indicato dal mittente che non
+    /// supererebbe la validazione (qui: IP cloud-metadata in chiaro) non
+    /// deve essere contattato: il messaggio resta bloccato con un errore
+    /// esplicito, non parte alcuna richiesta.
+    #[test]
+    fn timelocked_message_with_disallowed_sender_endpoint_is_not_contacted() {
+        let blob = sigillo_core::timelock::encode(
+            10_000_000,
+            Some("http://169.254.169.254/latest/meta-data/"),
+            b"contenuto interno",
+        );
+
+        let view = build_decrypt_view(
+            blob,
+            None,
+            message::SignatureStatus::Unsigned,
+            &settings_with_experimental(true),
+        );
+
+        assert_eq!(view.kind, "bloccato_nel_tempo");
+        assert_eq!(view.target_height, Some(10_000_000));
+        assert!(
+            view.height_check_error.is_some(),
+            "deve riportare perché l'endpoint non è stato contattato"
+        );
+    }
+
+    #[test]
+    fn validate_sender_supplied_endpoint_accepts_only_safe_public_https() {
+        // Ammessi: https verso un nome di dominio, e http SOLO per .onion.
+        assert!(
+            validate_sender_supplied_endpoint("https://mempool.space/api/blocks/tip/height").is_ok()
+        );
+        assert!(
+            validate_sender_supplied_endpoint("https://mempool.mio-nodo.example/altezza").is_ok()
+        );
+        assert!(validate_sender_supplied_endpoint(
+            "http://mempoolhqx4vs3tuk7mba5xpwmb2fzezvqm3vza3nnf5tz43yzysfid.onion/api/blocks/tip/height"
+        )
+        .is_ok());
+
+        // In chiaro verso un host non-onion: rivelerebbe l'apertura.
+        assert!(validate_sender_supplied_endpoint("http://mempool.space/altezza").is_err());
+        // IP letterali (SSRF verso rete interna / metadati cloud / loopback).
+        assert!(validate_sender_supplied_endpoint("https://127.0.0.1/altezza").is_err());
+        assert!(validate_sender_supplied_endpoint("https://[::1]/altezza").is_err());
+        assert!(
+            validate_sender_supplied_endpoint("https://169.254.169.254/latest/meta-data/").is_err()
+        );
+        assert!(validate_sender_supplied_endpoint("https://10.0.0.5:8332/altezza").is_err());
+        // localhost per nome.
+        assert!(validate_sender_supplied_endpoint("https://localhost/altezza").is_err());
+        assert!(validate_sender_supplied_endpoint("https://api.localhost/altezza").is_err());
+        // Schemi non http(s) e input non-URL.
+        assert!(validate_sender_supplied_endpoint("ftp://mempool.space/altezza").is_err());
+        assert!(validate_sender_supplied_endpoint("file:///etc/passwd").is_err());
+        assert!(validate_sender_supplied_endpoint("non è un url").is_err());
     }
 
     #[test]
