@@ -9,8 +9,9 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-/// Formato di cifratura scelto per le immagini. Il testo non ha questa
-/// scelta: è sempre ASCII armored.
+/// Formato di cifratura scelto per le immagini e per tutti gli altri file
+/// allegati (PDF, documenti...). Il testo non ha questa scelta: è sempre
+/// ASCII armored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ImageFormat {
