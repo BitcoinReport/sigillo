@@ -1,7 +1,9 @@
+mod attachments;
+
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use base64::Engine;
+use anyhow::Context;
 use serde::Serialize;
 use sequoia_openpgp::Cert;
 use tauri::{AppHandle, Manager, State};
@@ -928,62 +930,157 @@ fn encrypt_message(
     message::encrypt(&id.cert, &recipients, &plaintext, sign).map_err(|e| e.to_string())
 }
 
-/// Cifra un'immagine (o un altro file) leggendolo da `source_path` e
-/// scrivendo il risultato cifrato direttamente in `output_path`, senza
-/// far transitare i byte del file per il frontend: per un'immagine di
-/// alcuni MB è più veloce e non appesantisce l'interfaccia. Il nome
-/// originale del file viene incorporato nel messaggio OpenPGP, cosi chi
-/// decifra lo ritrova come nome suggerito. Il formato (.asc armato o
-/// .gpg binario) segue l'impostazione salvata in Avanzate.
+// ---------- Allegati: cifratura ----------
+
+/// Esegue un lavoro pesante (cifratura/decifratura di un file, copie) su
+/// un thread dedicato invece che sul thread principale dell'app: la
+/// finestra resta reattiva anche con allegati da centinaia di MB. Va
+/// fatto con `spawn_blocking` (e non con un semplice comando "async")
+/// perche' la verifica dell'altezza blocco usa un client HTTP bloccante,
+/// che non puo' girare dentro un task asincrono.
+async fn run_blocking<T: Send + 'static>(
+    job: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    tauri::async_runtime::spawn_blocking(job)
+        .await
+        .map_err(|e| format!("errore interno: {e}"))?
+}
+
+fn attachment_store(app: &AppHandle) -> Result<attachments::AttachmentStore, String> {
+    let dir = app
+        .path()
+        .app_cache_dir()
+        .map_err(|e| format!("impossibile trovare la cartella privata dell'app: {e}"))?;
+    Ok(attachments::AttachmentStore::new(dir.join("anteprime")))
+}
+
+/// Un file scelto per essere allegato, gia' descritto con le stesse
+/// regole usate in "Scrivi" (nome sanificato, tipo, dimensione).
+struct SourceFile {
+    path: PathBuf,
+    info: attachments::AttachmentInfo,
+}
+
+fn open_source_file(path: &str) -> Result<SourceFile, String> {
+    let path = PathBuf::from(path);
+    let info = attachments::describe_source_file(&path).map_err(|e| format!("{e:#}"))?;
+    Ok(SourceFile { path, info })
+}
+
+/// Scrive su `output_path` un messaggio cifrato il cui contenuto e'
+/// `prefix` seguito (se c'e') dal file `file`, copiato a pezzi: in
+/// memoria non ce n'e' mai piu' di qualche kilobyte alla volta, quindi
+/// vale per un PDF come per un video da centinaia di MB. Si scrive in
+/// un file provvisorio e lo si rinomina solo a cifratura riuscita: un
+/// errore (disco pieno, file cambiato nel frattempo) non lascia mai un
+/// file cifrato a meta' al posto di quello scelto dall'utente.
+fn encrypt_payload_to_file(
+    sender: &Cert,
+    recipients: &[Cert],
+    sign: bool,
+    armor: bool,
+    output_path: &str,
+    literal_name: Option<&str>,
+    prefix: &[u8],
+    file: Option<&SourceFile>,
+) -> Result<(), String> {
+    use std::io::{BufReader, BufWriter, Write};
+
+    let partial = format!("{output_path}.parte");
+    let result = (|| -> anyhow::Result<()> {
+        let mut out = BufWriter::new(
+            std::fs::File::create(&partial).context("impossibile creare il file cifrato")?,
+        );
+        message::encrypt_to_writer(sender, recipients, literal_name, sign, armor, &mut out, |w| {
+            w.write_all(prefix)?;
+            if let Some(file) = file {
+                let mut src = BufReader::new(
+                    std::fs::File::open(&file.path).context("impossibile leggere il file da allegare")?,
+                );
+                let copied = std::io::copy(&mut src, w)?;
+                if copied != file.info.size {
+                    anyhow::bail!("il file e' cambiato mentre veniva cifrato: riprova");
+                }
+            }
+            Ok(())
+        })?;
+        out.flush().context("impossibile salvare il file cifrato")?;
+        out.into_inner()
+            .map_err(|e| anyhow::anyhow!("impossibile salvare il file cifrato: {e}"))?
+            .sync_all()
+            .context("impossibile salvare il file cifrato")?;
+        std::fs::rename(&partial, output_path).context("impossibile salvare il file cifrato")?;
+        Ok(())
+    })();
+
+    if let Err(e) = result {
+        let _ = std::fs::remove_file(&partial);
+        return Err(format!("{e:#}"));
+    }
+    Ok(())
+}
+
+fn armor_setting(app: &AppHandle) -> Result<bool, String> {
+    let format = settings::load_image_format(&settings_path(app)?).map_err(|e| e.to_string())?;
+    Ok(format == settings::ImageFormat::Asc)
+}
+
+/// Cosa sapere di un file prima di allegarlo: nome (sanificato), tipo,
+/// dimensione, se e' un programma. Le stesse regole usate poi per
+/// cifrarlo; il contenuto non passa per l'interfaccia.
 #[tauri::command]
-fn encrypt_image(
+async fn attachment_info(path: String) -> Result<attachments::AttachmentInfo, String> {
+    run_blocking(move || {
+        attachments::describe_source_file(std::path::Path::new(&path)).map_err(|e| format!("{e:#}"))
+    })
+    .await
+}
+
+/// Cifra un file qualsiasi (immagine, video, PDF, documento...) leggendolo
+/// da `source_path` e scrivendo il risultato direttamente in
+/// `output_path`, senza far transitare i byte del file per il frontend.
+/// Il nome originale viaggia nel campo standard "nome file" del messaggio
+/// OpenPGP: chi decifra con Sigillo (o con un altro programma OpenPGP)
+/// ritrova il file con il suo nome. Il formato (.asc armato o .gpg
+/// binario) segue l'impostazione salvata in Avanzate.
+#[tauri::command]
+async fn encrypt_attachment(
     app: AppHandle,
-    state: State<AppState>,
     recipients_armored: Vec<String>,
     source_path: String,
     output_path: String,
     sign: bool,
     sender_index: Option<usize>,
 ) -> Result<(), String> {
-    let id = identity_by_index_or_active(&state, sender_index)?;
-    let recipients = recipients_from_armored(&recipients_armored)?;
-
-    let data = std::fs::read(&source_path)
-        .map_err(|e| format!("impossibile leggere il file immagine: {e}"))?;
-    let filename = std::path::Path::new(&source_path)
-        .file_name()
-        .map(|f| f.to_string_lossy().into_owned());
-
-    let format =
-        settings::load_image_format(&settings_path(&app)?).map_err(|e| e.to_string())?;
-    let armor = format == settings::ImageFormat::Asc;
-
-    let ciphertext = message::encrypt_bytes(
-        &id.cert,
-        &recipients,
-        &data,
-        filename.as_deref(),
-        sign,
-        armor,
-    )
-    .map_err(|e| e.to_string())?;
-
-    std::fs::write(&output_path, &ciphertext)
-        .map_err(|e| format!("impossibile salvare il file cifrato: {e}"))?;
-
-    Ok(())
+    run_blocking(move || {
+        let state = app.state::<AppState>();
+        let id = identity_by_index_or_active(&state, sender_index)?;
+        let recipients = recipients_from_armored(&recipients_armored)?;
+        let file = open_source_file(&source_path)?;
+        let armor = armor_setting(&app)?;
+        encrypt_payload_to_file(
+            &id.cert,
+            &recipients,
+            sign,
+            armor,
+            &output_path,
+            Some(&file.info.name),
+            &[],
+            Some(&file),
+        )
+    })
+    .await
 }
 
-/// Cifra insieme, in un unico file, un testo e un'immagine: il
+/// Cifra insieme, in un unico file, un testo e un allegato: il
 /// destinatario aprendo e decifrando quel singolo file ritrova entrambi,
-/// come un messaggio con didascalia e foto. I due contenuti vengono
-/// prima impacchettati con [`sigillo_core::composite::encode`] in
-/// un'unica sequenza di byte, poi cifrati normalmente: il motore
-/// crittografico non deve sapere che dentro ci sono due cose diverse.
+/// come un messaggio con didascalia e foto (o con un PDF). I due
+/// contenuti vengono impacchettati con [`sigillo_core::composite`] e poi
+/// cifrati normalmente: il motore crittografico non deve sapere che
+/// dentro ci sono due cose diverse.
 #[tauri::command]
-fn encrypt_combined(
+async fn encrypt_combined(
     app: AppHandle,
-    state: State<AppState>,
     recipients_armored: Vec<String>,
     plaintext: String,
     source_path: String,
@@ -991,52 +1088,39 @@ fn encrypt_combined(
     sign: bool,
     sender_index: Option<usize>,
 ) -> Result<(), String> {
-    let id = identity_by_index_or_active(&state, sender_index)?;
-    let recipients = recipients_from_armored(&recipients_armored)?;
+    run_blocking(move || {
+        let state = app.state::<AppState>();
+        let id = identity_by_index_or_active(&state, sender_index)?;
+        let recipients = recipients_from_armored(&recipients_armored)?;
+        let file = open_source_file(&source_path)?;
+        let armor = armor_setting(&app)?;
 
-    let image_data = std::fs::read(&source_path)
-        .map_err(|e| format!("impossibile leggere il file immagine: {e}"))?;
-    let image_filename = std::path::Path::new(&source_path)
-        .file_name()
-        .map(|f| f.to_string_lossy().into_owned());
-    let image_mime =
-        detect_media_mime(&image_data).ok_or("formato immagine o video non riconosciuto")?;
-
-    let format =
-        settings::load_image_format(&settings_path(&app)?).map_err(|e| e.to_string())?;
-    let armor = format == settings::ImageFormat::Asc;
-
-    let combined = sigillo_core::composite::encode(
-        &plaintext,
-        image_filename.as_deref(),
-        image_mime,
-        &image_data,
-    );
-
-    let ciphertext = message::encrypt_bytes(&id.cert, &recipients, &combined, None, sign, armor)
+        let header = sigillo_core::composite::encode_header(
+            &plaintext,
+            Some(&file.info.name),
+            &file.info.mime,
+            file.info.size,
+        )
         .map_err(|e| e.to_string())?;
 
-    std::fs::write(&output_path, &ciphertext)
-        .map_err(|e| format!("impossibile salvare il file cifrato: {e}"))?;
-
-    Ok(())
+        encrypt_payload_to_file(&id.cert, &recipients, sign, armor, &output_path, None, &header, Some(&file))
+    })
+    .await
 }
 
-/// Cifra un messaggio (testo, e/o un'immagine o video) con un blocco
-/// temporale applicativo: il testo e l'eventuale allegato vengono prima
-/// impacchettati esattamente come in [`encrypt_combined`], poi avvolti
-/// da [`sigillo_core::timelock::encode`] con l'altezza blocco target e
-/// l'endpoint di verifica scelto (che finisce nei metadati del
-/// messaggio, cosi' anche chi lo riceve verifica con lo stesso
-/// endpoint), infine cifrati normalmente: il vincolo e' applicativo
-/// (lo fa rispettare l'interfaccia di Sigillo), non crittografico — chi
-/// ha la chiave privata giusta puo' comunque decifrare il pacchetto
-/// OpenPGP in ogni momento, e' solo il contenuto a restare "nascosto"
-/// dall'app finche' l'altezza non e' raggiunta.
+/// Cifra un messaggio (testo, e/o un allegato) con un blocco temporale
+/// applicativo: testo e allegato vengono impacchettati esattamente come
+/// in [`encrypt_combined`], poi avvolti da [`sigillo_core::timelock`] con
+/// l'altezza blocco target e l'endpoint di verifica scelto (che finisce
+/// nei metadati del messaggio, cosi' anche chi lo riceve verifica con lo
+/// stesso endpoint), infine cifrati normalmente: il vincolo e'
+/// applicativo (lo fa rispettare l'interfaccia di Sigillo), non
+/// crittografico — chi ha la chiave privata giusta puo' comunque
+/// decifrare il pacchetto OpenPGP in ogni momento, e' solo il contenuto a
+/// restare "nascosto" dall'app finche' l'altezza non e' raggiunta.
 #[tauri::command]
-fn encrypt_timelocked(
+async fn encrypt_timelocked(
     app: AppHandle,
-    state: State<AppState>,
     recipients_armored: Vec<String>,
     plaintext: String,
     source_path: Option<String>,
@@ -1046,474 +1130,275 @@ fn encrypt_timelocked(
     target_height: u32,
     custom_endpoint: Option<String>,
 ) -> Result<(), String> {
-    let id = identity_by_index_or_active(&state, sender_index)?;
-    let recipients = recipients_from_armored(&recipients_armored)?;
+    run_blocking(move || {
+        let state = app.state::<AppState>();
+        let id = identity_by_index_or_active(&state, sender_index)?;
+        let recipients = recipients_from_armored(&recipients_armored)?;
+        let file = source_path.as_deref().map(open_source_file).transpose()?;
+        let armor = armor_setting(&app)?;
 
-    let inner: Vec<u8> = match &source_path {
-        Some(source_path) => {
-            let media_data = std::fs::read(source_path)
-                .map_err(|e| format!("impossibile leggere il file: {e}"))?;
-            let media_filename = std::path::Path::new(source_path)
-                .file_name()
-                .map(|f| f.to_string_lossy().into_owned());
-            let media_mime =
-                detect_media_mime(&media_data).ok_or("formato immagine o video non riconosciuto")?;
-            sigillo_core::composite::encode(&plaintext, media_filename.as_deref(), media_mime, &media_data)
-        }
-        None => plaintext.into_bytes(),
-    };
+        // Contenuto interno: un pacchetto combinato se c'e' un allegato,
+        // altrimenti il solo testo.
+        let (inner_prefix, inner_len) = match &file {
+            Some(file) => {
+                let header = sigillo_core::composite::encode_header(
+                    &plaintext,
+                    Some(&file.info.name),
+                    &file.info.mime,
+                    file.info.size,
+                )
+                .map_err(|e| e.to_string())?;
+                let total = header.len() as u64 + file.info.size;
+                (header, total)
+            }
+            None => {
+                let bytes = plaintext.into_bytes();
+                let total = bytes.len() as u64;
+                (bytes, total)
+            }
+        };
 
-    let endpoint = custom_endpoint.filter(|e| !e.trim().is_empty());
-    let locked = sigillo_core::timelock::encode(target_height, endpoint.as_deref(), &inner);
+        let endpoint = custom_endpoint.filter(|e| !e.trim().is_empty());
+        let mut prefix =
+            sigillo_core::timelock::encode_header(target_height, endpoint.as_deref(), inner_len)
+                .map_err(|e| e.to_string())?;
+        prefix.extend_from_slice(&inner_prefix);
 
-    let format = settings::load_image_format(&settings_path(&app)?).map_err(|e| e.to_string())?;
-    let armor = format == settings::ImageFormat::Asc;
-
-    let ciphertext = message::encrypt_bytes(&id.cert, &recipients, &locked, None, sign, armor)
-        .map_err(|e| e.to_string())?;
-
-    std::fs::write(&output_path, &ciphertext)
-        .map_err(|e| format!("impossibile salvare il file cifrato: {e}"))?;
-
-    Ok(())
+        encrypt_payload_to_file(&id.cert, &recipients, sign, armor, &output_path, None, &prefix, file.as_ref())
+    })
+    .await
 }
 
-/// Riconosce se `data` è un'immagine o un video nei formati comuni
-/// guardando i primi byte (che non cambiano cifrando/decifrando), non
-/// l'estensione del file: funziona anche se il mittente ha usato un
-/// altro programma OpenPGP che non imposta il nome file.
-fn detect_media_mime(data: &[u8]) -> Option<&'static str> {
-    if data.starts_with(&[0xFF, 0xD8, 0xFF]) {
-        return Some("image/jpeg");
-    }
-    if data.starts_with(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) {
-        return Some("image/png");
-    }
-    // GIF (sia la variante storica "87a" sia "89a", quella con
-    // animazione): la mostra un normale tag <img>, che anima da solo.
-    if data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a") {
-        return Some("image/gif");
-    }
-    if data.len() > 12 && &data[4..8] == b"ftyp" {
-        let brand = &data[8..12];
-        if matches!(
-            brand,
-            b"heic" | b"heix" | b"hevc" | b"heim" | b"heis" | b"hevm" | b"hevs" | b"mif1" | b"msf1"
-        ) {
-            return Some("image/heic");
-        }
-        if brand == b"qt  " {
-            return Some("video/quicktime");
-        }
-        // Le varianti piu' comuni del brand MP4 (ISO Base Media / MPEG-4).
-        if matches!(
-            brand,
-            b"isom" | b"iso2" | b"mp41" | b"mp42" | b"avc1" | b"M4V " | b"M4A " | b"3gp4" | b"3gp5"
-        ) {
-            return Some("video/mp4");
-        }
-    }
-    // Alcuni file .mov piu' vecchi non hanno un box "ftyp" iniziale:
-    // iniziano direttamente con uno dei box QuickTime piu' comuni.
-    if data.len() > 8 && matches!(&data[4..8], b"moov" | b"mdat" | b"free" | b"wide") {
-        return Some("video/quicktime");
-    }
-    None
-}
-
-/// Sopra questa soglia, un'immagine o un video decifrati non vengono
-/// incorporati come base64 nella risposta (appesantirebbe inutilmente
-/// il trasferimento verso l'interfaccia e il consumo di memoria): si
-/// scrivono invece su un file temporaneo, che l'utente puo' salvare
-/// altrove o aprire con il lettore predefinito del sistema.
-const LARGE_MEDIA_BYTES: usize = 60 * 1024 * 1024;
-
-fn sanitize_filename_component(name: &str) -> String {
-    std::path::Path::new(name)
-        .file_name()
-        .map(|f| f.to_string_lossy().into_owned())
-        .unwrap_or_default()
-}
-
-fn write_temp_media_file(data: &[u8], filename: Option<&str>) -> Result<PathBuf, String> {
-    let dir = std::env::temp_dir().join("sigillo-anteprime");
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| format!("impossibile creare la cartella temporanea: {e}"))?;
-
-    let base_name = filename
-        .map(sanitize_filename_component)
-        .filter(|n| !n.is_empty())
-        .unwrap_or_else(|| "file-decifrato".to_string());
-
-    let unique_prefix = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let path = dir.join(format!("{}-{}-{}", std::process::id(), unique_prefix, base_name));
-
-    std::fs::write(&path, data).map_err(|e| format!("impossibile salvare l'anteprima: {e}"))?;
-    Ok(path)
-}
-
-/// Rimuove eventuali file temporanei di anteprima rimasti da una
-/// sessione precedente (es. l'utente ha chiuso l'app senza salvare o
-/// aprire un video decifrato): sicuro da fare ad ogni avvio, perche'
-/// ogni decifratura crea sempre un file con un nome nuovo.
-fn cleanup_stale_temp_previews() {
-    let dir = std::env::temp_dir().join("sigillo-anteprime");
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// Prepara i campi "media" della risposta di decifratura: sotto soglia
-/// il contenuto viene incorporato come base64 (comportamento invariato
-/// per immagini e video di dimensione normale), sopra soglia viene
-/// scritto su file temporaneo. Ritorna (base64, mime, percorso_temp).
-fn media_view_fields(
-    data: &[u8],
-    mime: &str,
-    filename: Option<&str>,
-) -> (Option<String>, Option<String>, Option<String>) {
-    if data.len() > LARGE_MEDIA_BYTES {
-        if let Ok(path) = write_temp_media_file(data, filename) {
-            return (None, Some(mime.to_string()), Some(path.to_string_lossy().into_owned()));
-        }
-        // Se per qualche motivo non si riesce a scrivere il file
-        // temporaneo, ripiega sul base64 invece di far fallire tutto.
-    }
-    (
-        Some(base64::engine::general_purpose::STANDARD.encode(data)),
-        Some(mime.to_string()),
-        None,
-    )
-}
+// ---------- Allegati: decifratura ----------
 
 #[derive(Serialize)]
 struct DecryptView {
-    /// "testo", "immagine", "video", "combinato" (testo + immagine/video),
+    /// "testo", "allegato" (solo un file), "combinato" (testo + file) o
     /// "bloccato_nel_tempo" (funzione sperimentale, altezza target non
-    /// ancora raggiunta) o "file" (contenuto binario non riconosciuto).
+    /// ancora raggiunta).
     kind: String,
     plaintext: Option<String>,
-    image_data_base64: Option<String>,
-    image_mime: Option<String>,
-    /// Presente solo per immagini/video sopra `LARGE_MEDIA_BYTES`: al
-    /// posto di `image_data_base64`, il percorso di un file temporaneo
-    /// gia' scritto su disco.
-    media_temp_path: Option<String>,
-    filename: Option<String>,
+    /// Il file decifrato, su disco nella cartella privata dell'app: al
+    /// frontend arrivano solo percorso e metadati, mai i byte.
+    attachment: Option<attachments::AttachmentView>,
     signature_status: String,
     signer_fingerprint: Option<String>,
     /// Solo per un messaggio con blocco temporale (bloccato o appena
     /// sbloccato): l'altezza target.
     target_height: Option<u32>,
-    /// Solo per "bloccato_nel_tempo": l'altezza corrente, se la
-    /// verifica è riuscita.
+    /// Solo per un messaggio con blocco temporale: l'altezza corrente,
+    /// se la verifica e' riuscita.
     current_height: Option<u32>,
     /// Solo per "bloccato_nel_tempo": presente se la verifica
-    /// dell'altezza corrente è fallita (rete assente, endpoint non
+    /// dell'altezza corrente e' fallita (rete assente, endpoint non
     /// raggiungibile...), invece di current_height.
     height_check_error: Option<String>,
 }
 
-/// Come [`build_decrypt_view_inner`], ma riconosce prima di tutto un
-/// eventuale blocco temporale (funzione sperimentale): se presente,
-/// verifica l'altezza blocco corrente (secondo le preferenze Tor/
-/// endpoint salvate) e mostra il contenuto solo se l'altezza target è
-/// già stata raggiunta, altrimenti quanto manca.
-fn build_decrypt_view(
-    data: Vec<u8>,
-    filename: Option<String>,
-    signature: message::SignatureStatus,
-    settings: &settings::Settings,
-) -> DecryptView {
-    let (signature_status, signer_fingerprint) = match signature {
+fn decrypt_view_from(outcome: message::StreamOutcome<attachments::Processed>) -> DecryptView {
+    let (signature_status, signer_fingerprint) = match outcome.signature {
         message::SignatureStatus::Unsigned => ("non_firmato".to_string(), None),
         message::SignatureStatus::Verified(fp) => {
             ("verificata".to_string(), Some(fp.to_spaced_hex()))
         }
         message::SignatureStatus::Unverifiable => ("non_verificabile".to_string(), None),
     };
-
-    // Il blocco temporale è una funzione *sperimentale*: finché l'utente
-    // non l'ha attivata esplicitamente (default: spenta), un messaggio
-    // marcato come "bloccato nel tempo" NON deve essere processato come
-    // tale — in particolare non deve far partire la verifica dell'altezza
-    // blocco, che è una richiesta di rete verso un endpoint indicato
-    // *dentro* il messaggio dal mittente. Senza questo controllo, aprire
-    // un messaggio ostile equivarrebbe a un "tracking pixel" (rivela IP e
-    // orario di apertura a chi l'ha mandato) e a un possibile SSRF verso
-    // risorse di rete interne, del tutto all'insaputa di chi non ha mai
-    // toccato le funzioni sperimentali. A feature spenta lo trattiamo
-    // quindi come un dato binario opaco (salvabile come file).
-    if settings.experimental_features_enabled && sigillo_core::timelock::is_timelocked(&data) {
-        if let Ok(locked) = sigillo_core::timelock::decode(&data) {
-            // Un endpoint incluso nel messaggio è scelto dal mittente, non
-            // da chi riceve: prima di contattarlo va ristretto (solo https,
-            // niente IP letterali o localhost — vedi la funzione).
-            if let Some(sender_endpoint) = locked
-                .endpoint
-                .as_deref()
-                .map(str::trim)
-                .filter(|e| !e.is_empty())
-            {
-                if let Err(why) = validate_sender_supplied_endpoint(sender_endpoint) {
-                    return DecryptView {
-                        kind: "bloccato_nel_tempo".to_string(),
-                        plaintext: None,
-                        image_data_base64: None,
-                        image_mime: None,
-                        media_temp_path: None,
-                        filename,
-                        signature_status,
-                        signer_fingerprint,
-                        target_height: Some(locked.target_height),
-                        current_height: None,
-                        height_check_error: Some(why),
-                    };
-                }
-            }
-
-            let endpoint = effective_endpoint(locked.endpoint.as_deref());
-            let use_tor = should_use_tor(&endpoint, settings.tor_enabled);
-            match fetch_block_height(&endpoint, use_tor, &settings.tor_socks_host, settings.tor_socks_port) {
-                Ok(current) if current >= locked.target_height => {
-                    // Altezza raggiunta: si mostra il contenuto interno
-                    // come al solito, con in più l'indicazione che era
-                    // (ed è ora) sbloccato.
-                    let mut view = build_decrypt_view_inner(
-                        locked.inner,
-                        filename,
-                        signature_status,
-                        signer_fingerprint,
-                    );
-                    view.target_height = Some(locked.target_height);
-                    view.current_height = Some(current);
-                    return view;
-                }
-                Ok(current) => {
-                    return DecryptView {
-                        kind: "bloccato_nel_tempo".to_string(),
-                        plaintext: None,
-                        image_data_base64: None,
-                        image_mime: None,
-                        media_temp_path: None,
-                        filename,
-                        signature_status,
-                        signer_fingerprint,
-                        target_height: Some(locked.target_height),
-                        current_height: Some(current),
-                        height_check_error: None,
-                    };
-                }
-                Err(height_check_error) => {
-                    return DecryptView {
-                        kind: "bloccato_nel_tempo".to_string(),
-                        plaintext: None,
-                        image_data_base64: None,
-                        image_mime: None,
-                        media_temp_path: None,
-                        filename,
-                        signature_status,
-                        signer_fingerprint,
-                        target_height: Some(locked.target_height),
-                        current_height: None,
-                        height_check_error: Some(height_check_error),
-                    };
-                }
-            }
-        }
-        // Marcato come bloccato nel tempo ma illeggibile: ripiega sul
-        // trattarlo come gli altri casi, invece di far fallire tutto.
-    }
-
-    build_decrypt_view_inner(data, filename, signature_status, signer_fingerprint)
-}
-
-/// Nucleo di `build_decrypt_view`: riconosce testo/immagine/video/file,
-/// assumendo che `data` NON sia (più) un pacchetto con blocco temporale
-/// (quello è gestito da `build_decrypt_view`, che chiama questa funzione
-/// sia per un messaggio mai bloccato sia per il contenuto interno di
-/// uno appena sbloccato).
-fn build_decrypt_view_inner(
-    data: Vec<u8>,
-    filename: Option<String>,
-    signature_status: String,
-    signer_fingerprint: Option<String>,
-) -> DecryptView {
-    // Va controllato prima degli altri due casi: un pacchetto combinato
-    // non ha i byte magici di un'immagine/video puro, ma per puro caso
-    // i suoi byte potrebbero comunque risultare UTF-8 valido, finendo
-    // scambiati per testo semplice se non lo si riconosce per primo.
-    if sigillo_core::composite::is_combined(&data) {
-        if let Ok(combined) = sigillo_core::composite::decode(&data) {
-            let (image_data_base64, image_mime, media_temp_path) = media_view_fields(
-                &combined.image_data,
-                &combined.image_mime,
-                combined.image_filename.as_deref(),
-            );
-            return DecryptView {
-                kind: "combinato".to_string(),
-                plaintext: Some(combined.text),
-                image_data_base64,
-                image_mime,
-                media_temp_path,
-                filename: combined.image_filename,
-                signature_status,
-                signer_fingerprint,
-                target_height: None,
-                current_height: None,
-                height_check_error: None,
-            };
-        }
-        // Pacchetto marcato come combinato ma illeggibile: ripiega sul
-        // trattarlo come gli altri casi, invece di far fallire tutto.
-    }
-
-    if let Some(mime) = detect_media_mime(&data) {
-        let kind = if mime.starts_with("video/") { "video" } else { "immagine" };
-        let (image_data_base64, image_mime, media_temp_path) =
-            media_view_fields(&data, mime, filename.as_deref());
-        return DecryptView {
-            kind: kind.to_string(),
-            plaintext: None,
-            image_data_base64,
-            image_mime,
-            media_temp_path,
-            filename,
-            signature_status,
-            signer_fingerprint,
-            target_height: None,
-            current_height: None,
-            height_check_error: None,
-        };
-    }
-
-    if let Ok(text) = String::from_utf8(data.clone()) {
-        return DecryptView {
-            kind: "testo".to_string(),
-            plaintext: Some(text),
-            image_data_base64: None,
-            image_mime: None,
-            media_temp_path: None,
-            filename,
-            signature_status,
-            signer_fingerprint,
-            target_height: None,
-            current_height: None,
-            height_check_error: None,
-        };
-    }
-
+    let processed = outcome.value;
     DecryptView {
-        kind: "file".to_string(),
-        plaintext: None,
-        image_data_base64: Some(base64::engine::general_purpose::STANDARD.encode(&data)),
-        image_mime: None,
-        media_temp_path: None,
-        filename,
+        kind: processed.kind.to_string(),
+        plaintext: processed.plaintext,
+        attachment: processed.attachment,
         signature_status,
         signer_fingerprint,
-        target_height: None,
-        current_height: None,
-        height_check_error: None,
+        target_height: processed.target_height,
+        current_height: processed.current_height,
+        height_check_error: processed.height_check_error,
     }
 }
 
-/// Copia un file temporaneo di anteprima (vedi `media_view_fields`)
-/// nella destinazione scelta dall'utente, e prova a ripulire il
-/// temporaneo dopo: usato dal pulsante "Salva..." quando la
-/// decifratura di un'immagine/video di grandi dimensioni non ha
-/// incorporato i byte nella risposta.
-#[tauri::command]
-fn save_temp_media(temp_path: String, dest_path: String) -> Result<(), String> {
-    std::fs::copy(&temp_path, &dest_path)
-        .map_err(|e| format!("impossibile salvare il file: {e}"))?;
-    let _ = std::fs::remove_file(&temp_path);
-    Ok(())
+type CipherInput<'a> = Box<dyn std::io::Read + Send + Sync + 'a>;
+
+/// Da dove viene il messaggio cifrato: testo incollato, o un file su disco
+/// (che si legge a pezzi, senza caricarlo in memoria).
+enum CipherSource<'a> {
+    Text(&'a str),
+    File(&'a str),
 }
 
-/// Decifra un contenuto incollato come testo (funziona sia per un
-/// messaggio di testo sia per un'immagine cifrata in formato .asc: in
-/// entrambi i casi l'input è testo ASCII armored). Il tipo di contenuto
-/// reale (testo/immagine/file) è determinato dopo la decifratura.
-/// Prova a decifrare `input` con ciascuna delle identità disponibili sul
+fn open_cipher_input<'a>(source: &CipherSource<'a>) -> Result<CipherInput<'a>, String> {
+    match source {
+        CipherSource::Text(text) => Ok(Box::new(std::io::Cursor::new(text.as_bytes()))),
+        CipherSource::File(path) => std::fs::File::open(path)
+            .map(|f| Box::new(f) as CipherInput<'a>)
+            .map_err(|e| format!("impossibile leggere il file: {e}")),
+    }
+}
+
+/// Prova a decifrare con ciascuna delle identita' disponibili sul
 /// dispositivo, non solo quella attiva: un messaggio in arrivo potrebbe
-/// essere indirizzato a una qualsiasi delle identità dell'utente, non
-/// necessariamente quella scelta l'ultima volta in "La mia identità".
-/// Nucleo di `decrypt_with_any_identity`, separato per poter essere
-/// testato senza dover costruire un `State<AppState>` (che richiede il
-/// runtime di Tauri): prova `certs` uno per uno, nell'ordine dato,
-/// finché uno non riesce a decifrare `input`.
-fn decrypt_with_any_cert(
+/// essere indirizzato a una qualsiasi delle identita' dell'utente,
+/// non necessariamente quella scelta l'ultima volta in "La mia identita'".
+/// Separata da `decrypt_to_view` per poterla testare senza costruire il
+/// runtime di Tauri: prova `certs` uno per uno, nell'ordine dato, finche'
+/// uno non riesce. `open_input` produce un lettore nuovo per ogni
+/// tentativo; `rollback` si chiama dopo un tentativo fallito (per
+/// buttare via quello che `consume` aveva eventualmente scritto).
+fn decrypt_streaming_with_any_cert<'a, T>(
     certs: &[Cert],
     contacts_certs: &[Cert],
-    input: &[u8],
-) -> Result<message::DecryptedBytes, String> {
+    open_input: &dyn Fn() -> Result<CipherInput<'a>, String>,
+    consume: &mut dyn FnMut(&mut dyn std::io::Read, &dyn Fn() -> Option<String>) -> anyhow::Result<T>,
+    rollback: &mut dyn FnMut(),
+) -> Result<message::StreamOutcome<T>, String> {
     if certs.is_empty() {
         return Err("genera o importa prima la tua identità".to_string());
     }
 
-    let mut last_err = None;
+    // Fra piu' errori si preferisce quello che dice qualcosa di utile
+    // sul messaggio (es. "danneggiato") a "non e' indirizzato a te".
+    let mut best_err: Option<String> = None;
     for cert in certs {
-        match message::decrypt_bytes(cert, contacts_certs, input) {
-            Ok(result) => return Ok(result),
-            Err(e) => last_err = Some(e.to_string()),
+        let input = open_input()?;
+        let attempt = message::decrypt_streaming(
+            cert,
+            contacts_certs,
+            input,
+            |plain: &mut dyn std::io::Read, name: &dyn Fn() -> Option<String>| consume(plain, name),
+        );
+        match attempt {
+            Ok(outcome) => return Ok(outcome),
+            Err(e) => {
+                rollback();
+                let msg = format!("{e:#}");
+                let is_mismatch = msg.contains("non è indirizzato a te");
+                if best_err.is_none() || !is_mismatch {
+                    best_err = Some(msg);
+                }
+            }
         }
     }
-    Err(last_err.unwrap_or_else(|| "impossibile decifrare il messaggio".to_string()))
+    Err(best_err.unwrap_or_else(|| "impossibile decifrare il messaggio".to_string()))
 }
 
-fn decrypt_with_any_identity(
+/// Decifra `source` e lo traduce in quello che vede l'utente. Un
+/// allegato viene scritto su file (mai passato come stringa all'interfaccia);
+/// se alla fine il messaggio non risulta autentico (troncato, manomesso)
+/// i file scritti vengono rimossi e il risultato e' un errore.
+fn decrypt_to_view(
+    app: &AppHandle,
     state: &State<AppState>,
-    contacts_certs: &[Cert],
-    input: &[u8],
-) -> Result<message::DecryptedBytes, String> {
-    let identities = state.identities.lock().unwrap();
-    let certs: Vec<Cert> = identities.iter().map(|li| li.identity.cert.clone()).collect();
-    decrypt_with_any_cert(&certs, contacts_certs, input)
+    contacts_armored: &[String],
+    source: CipherSource,
+) -> Result<DecryptView, String> {
+    let contacts_certs = recipients_from_armored(contacts_armored)?;
+    // Si copiano i certificati fuori dal lucchetto: la decifratura (e
+    // l'eventuale verifica di rete del blocco temporale) non deve tenere
+    // bloccate le altre operazioni.
+    let certs: Vec<Cert> = {
+        let identities = state.identities.lock().unwrap();
+        identities.iter().map(|li| li.identity.cert.clone()).collect()
+    };
+    let settings = settings::load_settings(&settings_path(app)?).map_err(|e| e.to_string())?;
+
+    let store = attachment_store(app)?;
+    let session = attachments::Session::new(&store);
+    let fetch_height = |endpoint: &str, use_tor: bool| {
+        fetch_block_height(endpoint, use_tor, &settings.tor_socks_host, settings.tor_socks_port)
+    };
+
+    let outcome = decrypt_streaming_with_any_cert(
+        &certs,
+        &contacts_certs,
+        &|| open_cipher_input(&source),
+        &mut |plain, name| attachments::process_plaintext(plain, name, &settings, &session, &fetch_height),
+        &mut || session.rollback(),
+    )?;
+    session.commit();
+    Ok(decrypt_view_from(outcome))
 }
 
+/// Decifra un contenuto incollato come testo (funziona sia per un
+/// messaggio di testo sia per un file cifrato in formato .asc: in
+/// entrambi i casi l'input e' testo ASCII armored). Il tipo di contenuto
+/// reale (testo/allegato) e' determinato dopo la decifratura.
 #[tauri::command]
-fn decrypt_message(
+async fn decrypt_message(
     app: AppHandle,
-    state: State<AppState>,
     contacts_armored: Vec<String>,
     ciphertext: String,
 ) -> Result<DecryptView, String> {
-    let contacts_certs = recipients_from_armored(&contacts_armored)?;
-    let decrypted = decrypt_with_any_identity(&state, &contacts_certs, ciphertext.as_bytes())?;
-    let settings = settings::load_settings(&settings_path(&app)?).map_err(|e| e.to_string())?;
-
-    Ok(build_decrypt_view(
-        decrypted.data,
-        decrypted.filename,
-        decrypted.signature,
-        &settings,
-    ))
+    run_blocking(move || {
+        let state = app.state::<AppState>();
+        decrypt_to_view(&app, &state, &contacts_armored, CipherSource::Text(&ciphertext))
+    })
+    .await
 }
 
 /// Come [`decrypt_message`], ma leggendo l'input da un file su disco
 /// invece che da testo incollato: serve per i file .gpg (binari, non
-/// incollabili in una casella di testo).
+/// incollabili in una casella di testo) e per i messaggi grandi, che
+/// cosi' non transitano per l'interfaccia.
 #[tauri::command]
-fn decrypt_file(
+async fn decrypt_file(
     app: AppHandle,
-    state: State<AppState>,
     contacts_armored: Vec<String>,
     path: String,
 ) -> Result<DecryptView, String> {
-    let contacts_certs = recipients_from_armored(&contacts_armored)?;
+    run_blocking(move || {
+        let state = app.state::<AppState>();
+        decrypt_to_view(&app, &state, &contacts_armored, CipherSource::File(&path))
+    })
+    .await
+}
 
-    let input = std::fs::read(&path).map_err(|e| format!("impossibile leggere il file: {e}"))?;
-    let decrypted = decrypt_with_any_identity(&state, &contacts_certs, &input)?;
-    let settings = settings::load_settings(&settings_path(&app)?).map_err(|e| e.to_string())?;
+/// Copia un allegato decifrato nella destinazione scelta dall'utente.
+/// Rifiuta qualunque origine che non sia nella cartella privata dell'app.
+#[tauri::command]
+async fn save_decrypted_attachment(
+    app: AppHandle,
+    temp_path: String,
+    dest_path: String,
+) -> Result<(), String> {
+    run_blocking(move || {
+        let store = attachment_store(&app)?;
+        attachments::copy_to_destination(
+            &store,
+            std::path::Path::new(&temp_path),
+            std::path::Path::new(&dest_path),
+        )
+        .map_err(|e| format!("{e:#}"))
+    })
+    .await
+}
 
-    Ok(build_decrypt_view(
-        decrypted.data,
-        decrypted.filename,
-        decrypted.signature,
-        &settings,
-    ))
+/// Apre un allegato decifrato con il programma predefinito del sistema.
+/// Per i programmi e gli script (`.exe`, `.sh`, `.apk`...) serve
+/// `confirmed = true`, cioe' che l'utente abbia visto l'avviso; non si
+/// apre mai nulla in automatico. Su Android/iOS il plugin usa il
+/// meccanismo nativo di apertura.
+#[tauri::command]
+fn open_decrypted_attachment(app: AppHandle, path: String, confirmed: bool) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+
+    let store = attachment_store(&app)?;
+    attachments::check_open_allowed(&store, std::path::Path::new(&path), confirmed)
+        .map_err(|e| format!("{e:#}"))?;
+    app.opener().open_path(path, None::<&str>).map_err(|_| {
+        "Non riesco ad aprire il file: forse sul tuo dispositivo non c'è un programma adatto. \
+         Puoi comunque salvarlo e aprirlo da dove preferisci."
+            .to_string()
+    })
+}
+
+/// Elimina un allegato decifrato dalla cartella privata (quando si lascia
+/// la schermata, o dopo averlo salvato). Un percorso che non e' un
+/// allegato di Sigillo viene rifiutato.
+#[tauri::command]
+fn discard_decrypted_attachment(app: AppHandle, path: String) -> Result<(), String> {
+    let store = attachment_store(&app)?;
+    store
+        .discard(std::path::Path::new(&path))
+        .map_err(|e| format!("{e:#}"))
 }
 
 /// Su Linux la webview è WebKitGTK, che per riprodurre un video (anteprima
@@ -1564,14 +1449,20 @@ pub fn run() {
     // processo e viene letta durante la scansione del registry di GStreamer.
     force_software_video_decoding();
 
-    cleanup_stale_temp_previews();
-
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .manage(AppState::default())
+        .setup(|app| {
+            // Eventuali allegati decifrati rimasti da una sessione
+            // interrotta (chiusura forzata, crash, spegnimento).
+            if let Ok(store) = attachment_store(app.handle()) {
+                store.purge();
+            }
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             identity_exists_on_disk,
             app_version,
@@ -1596,23 +1487,49 @@ pub fn run() {
             set_tor_settings,
             check_block_height,
             encrypt_message,
-            encrypt_image,
+            attachment_info,
+            encrypt_attachment,
             encrypt_combined,
             encrypt_timelocked,
             decrypt_message,
             decrypt_file,
-            save_temp_media,
+            save_decrypted_attachment,
+            open_decrypted_attachment,
+            discard_decrypted_attachment,
         ])
-        .run(tauri::generate_context!())
-        .expect("errore durante l'avvio di Sigillo");
+        .build(tauri::generate_context!())
+        .expect("errore durante l'avvio di Sigillo")
+        .run(|app, event| {
+            // Alla chiusura dell'app nessun allegato decifrato (in chiaro)
+            // deve restare sul disco.
+            if let tauri::RunEvent::Exit = event {
+                if let Ok(store) = attachment_store(app) {
+                    store.purge();
+                }
+            }
+        });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    // ---------- Decifratura con piu' identita' ----------
+
+    fn text_consumer() -> impl FnMut(&mut dyn std::io::Read, &dyn Fn() -> Option<String>) -> anyhow::Result<String> {
+        |plain, _name| {
+            let mut out = String::new();
+            std::io::Read::read_to_string(plain, &mut out)?;
+            Ok(out)
+        }
+    }
+
+    fn text_input<'a>(armored: &'a str) -> impl Fn() -> Result<CipherInput<'a>, String> + 'a {
+        move || Ok(Box::new(std::io::Cursor::new(armored.as_bytes())) as CipherInput<'a>)
+    }
+
     #[test]
-    fn decrypt_with_any_cert_tries_every_identity_until_one_matches() {
+    fn decrypt_tries_every_identity_until_one_matches() {
         let alice = identity::generate(identity::SeedWordCount::Twelve, "Alice").unwrap();
         let bob = identity::generate(identity::SeedWordCount::Twelve, "Bob").unwrap();
         let carol = identity::generate(identity::SeedWordCount::Twelve, "Carol").unwrap();
@@ -1624,12 +1541,21 @@ mod tests {
             message::encrypt(&alice.cert, &[carol.cert.clone()], "solo per Carol", false).unwrap();
 
         let certs = vec![alice.cert.clone(), bob.cert.clone(), carol.cert.clone()];
-        let result = decrypt_with_any_cert(&certs, &[], ciphertext.as_bytes()).unwrap();
-        assert_eq!(String::from_utf8(result.data).unwrap(), "solo per Carol");
+        let mut rollbacks = 0;
+        let outcome = decrypt_streaming_with_any_cert(
+            &certs,
+            &[],
+            &text_input(&ciphertext),
+            &mut text_consumer(),
+            &mut || rollbacks += 1,
+        )
+        .unwrap();
+        assert_eq!(outcome.value, "solo per Carol");
+        assert_eq!(rollbacks, 2, "le due identita' sbagliate vanno scartate");
     }
 
     #[test]
-    fn decrypt_with_any_cert_fails_clearly_when_no_identity_matches() {
+    fn decrypt_fails_clearly_when_no_identity_matches() {
         let alice = identity::generate(identity::SeedWordCount::Twelve, "Alice").unwrap();
         let bob = identity::generate(identity::SeedWordCount::Twelve, "Bob").unwrap();
         let mallory = identity::generate(identity::SeedWordCount::Twelve, "Mallory").unwrap();
@@ -1638,14 +1564,66 @@ mod tests {
             message::encrypt(&alice.cert, &[bob.cert.clone()], "solo per Bob", false).unwrap();
 
         // Sul dispositivo c'e' solo Mallory: nessuna identita' corrisponde.
-        let certs = vec![mallory.cert.clone()];
-        assert!(decrypt_with_any_cert(&certs, &[], ciphertext.as_bytes()).is_err());
+        let err = match decrypt_streaming_with_any_cert(
+            &[mallory.cert.clone()],
+            &[],
+            &text_input(&ciphertext),
+            &mut text_consumer(),
+            &mut || {},
+        ) {
+            Ok(_) => panic!("doveva fallire"),
+            Err(e) => e,
+        };
+        assert!(err.contains("non è indirizzato a te"), "{err}");
     }
 
     #[test]
-    fn decrypt_with_any_cert_reports_missing_identity_when_none_loaded() {
-        let err = decrypt_with_any_cert(&[], &[], b"qualunque cosa").unwrap_err();
+    fn decrypt_reports_missing_identity_when_none_loaded() {
+        let err = match decrypt_streaming_with_any_cert(
+            &[],
+            &[],
+            &text_input("qualunque cosa"),
+            &mut text_consumer(),
+            &mut || {},
+        ) {
+            Ok(_) => panic!("doveva fallire"),
+            Err(e) => e,
+        };
         assert!(err.contains("genera o importa"));
+    }
+
+    #[test]
+    fn a_damaged_message_is_not_reported_as_addressed_to_someone_else() {
+        // Con piu' identita', l'errore utile ("danneggiato") non deve
+        // essere coperto da quello generico delle identita' sbagliate.
+        let alice = identity::generate(identity::SeedWordCount::Twelve, "Alice").unwrap();
+        let bob = identity::generate(identity::SeedWordCount::Twelve, "Bob").unwrap();
+        let carol = identity::generate(identity::SeedWordCount::Twelve, "Carol").unwrap();
+        let mut sink = Vec::new();
+        message::encrypt_to_writer(&alice.cert, &[bob.cert.clone()], Some("x.bin"), false, false, &mut sink, |w| {
+            std::io::Write::write_all(w, &vec![7u8; 50_000])?;
+            Ok(())
+        })
+        .unwrap();
+        let mid = sink.len() / 2;
+        sink[mid] ^= 1;
+
+        let certs = vec![bob.cert.clone(), carol.cert.clone()];
+        let err = match decrypt_streaming_with_any_cert(
+            &certs,
+            &[],
+            &|| Ok(Box::new(std::io::Cursor::new(sink.clone())) as CipherInput<'_>),
+            &mut |plain, _| {
+                let mut v = Vec::new();
+                std::io::Read::read_to_end(plain, &mut v)?;
+                Ok(v)
+            },
+            &mut || {},
+        ) {
+            Ok(_) => panic!("un messaggio manomesso non deve decifrarsi"),
+            Err(e) => e,
+        };
+        assert!(!err.contains("non è indirizzato a te"), "{err}");
     }
 
     // ---------- Time-lock ----------
@@ -1812,70 +1790,10 @@ mod tests {
 
     // ---------- Time-lock: privacy / SSRF alla decifratura ----------
 
-    fn settings_with_experimental(enabled: bool) -> settings::Settings {
-        let mut s = settings::Settings::default();
-        s.experimental_features_enabled = enabled;
-        s
-    }
-
-    /// Il bug: un messaggio marcato come "bloccato nel tempo" faceva
-    /// partire una richiesta di rete (verso un endpoint scelto dal
-    /// mittente) al solo aprirlo, ANCHE se l'utente non aveva mai
-    /// attivato le funzioni sperimentali. A feature spenta il messaggio
-    /// deve invece essere trattato come dato opaco, senza toccare la rete.
-    #[test]
-    fn timelocked_message_is_inert_when_experimental_features_are_off() {
-        // Endpoint volutamente "cattivo" (metadati cloud): se il gate non
-        // funzionasse, questo test proverebbe a contattarlo.
-        let blob = sigillo_core::timelock::encode(
-            10_000_000,
-            Some("http://169.254.169.254/latest/meta-data/"),
-            b"contenuto interno del messaggio bloccato",
-        );
-
-        let view = build_decrypt_view(
-            blob,
-            None,
-            message::SignatureStatus::Unsigned,
-            &settings_with_experimental(false),
-        );
-
-        assert_ne!(
-            view.kind, "bloccato_nel_tempo",
-            "a funzioni sperimentali spente il messaggio non deve essere processato come time-lock"
-        );
-        assert_eq!(view.kind, "file", "va mostrato come dato grezzo salvabile");
-        assert!(view.target_height.is_none());
-        assert!(view.current_height.is_none());
-        assert!(view.height_check_error.is_none());
-    }
-
-    /// A feature attiva, un endpoint indicato dal mittente che non
-    /// supererebbe la validazione (qui: IP cloud-metadata in chiaro) non
-    /// deve essere contattato: il messaggio resta bloccato con un errore
-    /// esplicito, non parte alcuna richiesta.
-    #[test]
-    fn timelocked_message_with_disallowed_sender_endpoint_is_not_contacted() {
-        let blob = sigillo_core::timelock::encode(
-            10_000_000,
-            Some("http://169.254.169.254/latest/meta-data/"),
-            b"contenuto interno",
-        );
-
-        let view = build_decrypt_view(
-            blob,
-            None,
-            message::SignatureStatus::Unsigned,
-            &settings_with_experimental(true),
-        );
-
-        assert_eq!(view.kind, "bloccato_nel_tempo");
-        assert_eq!(view.target_height, Some(10_000_000));
-        assert!(
-            view.height_check_error.is_some(),
-            "deve riportare perché l'endpoint non è stato contattato"
-        );
-    }
+    // I test del comportamento a funzioni sperimentali spente / con endpoint
+    // non ammessi, e dell'interpretazione dei contenuti decifrati, sono in
+    // `attachments.rs`: li' la verifica dell'altezza blocco e' iniettata e
+    // un test fallisce se parte una richiesta di rete che non doveva partire.
 
     #[test]
     fn validate_sender_supplied_endpoint_accepts_only_safe_public_https() {
@@ -1907,107 +1825,5 @@ mod tests {
         assert!(validate_sender_supplied_endpoint("ftp://mempool.space/altezza").is_err());
         assert!(validate_sender_supplied_endpoint("file:///etc/passwd").is_err());
         assert!(validate_sender_supplied_endpoint("non è un url").is_err());
-    }
-
-    #[test]
-    fn detects_mp4_via_ftyp_isom_brand() {
-        let mut data = vec![0u8; 4];
-        data.extend_from_slice(b"ftyp");
-        data.extend_from_slice(b"isom");
-        data.extend_from_slice(&[0u8; 20]);
-        assert_eq!(detect_media_mime(&data), Some("video/mp4"));
-    }
-
-    #[test]
-    fn detects_mov_via_ftyp_qt_brand() {
-        let mut data = vec![0u8; 4];
-        data.extend_from_slice(b"ftyp");
-        data.extend_from_slice(b"qt  ");
-        data.extend_from_slice(&[0u8; 20]);
-        assert_eq!(detect_media_mime(&data), Some("video/quicktime"));
-    }
-
-    #[test]
-    fn detects_older_mov_without_ftyp_box() {
-        let mut data = vec![0u8; 4];
-        data.extend_from_slice(b"moov");
-        data.extend_from_slice(&[0u8; 20]);
-        assert_eq!(detect_media_mime(&data), Some("video/quicktime"));
-    }
-
-    #[test]
-    fn still_detects_images_unaffected_by_video_support() {
-        assert_eq!(
-            detect_media_mime(&[0xFF, 0xD8, 0xFF, 0, 0]),
-            Some("image/jpeg")
-        );
-    }
-
-    #[test]
-    fn detects_gif_both_87a_and_89a() {
-        let mut old = b"GIF87a".to_vec();
-        old.extend_from_slice(&[0u8; 16]);
-        assert_eq!(detect_media_mime(&old), Some("image/gif"));
-
-        let mut animated = b"GIF89a".to_vec();
-        animated.extend_from_slice(&[0u8; 16]);
-        assert_eq!(detect_media_mime(&animated), Some("image/gif"));
-    }
-
-    #[test]
-    fn text_starting_like_gif_but_not_a_gif_is_not_detected() {
-        assert_eq!(detect_media_mime(b"GIF ma non davvero"), None);
-    }
-
-    #[test]
-    fn plain_text_is_not_detected_as_media() {
-        assert_eq!(detect_media_mime(b"ciao, sono testo normale"), None);
-    }
-
-    #[test]
-    fn small_media_is_embedded_as_base64_not_temp_file() {
-        let (b64, mime, temp) = media_view_fields(&[1, 2, 3, 4], "image/png", Some("foto.png"));
-        assert!(b64.is_some());
-        assert_eq!(mime.as_deref(), Some("image/png"));
-        assert!(temp.is_none());
-    }
-
-    #[test]
-    fn large_media_is_written_to_a_temp_file_not_base64() {
-        let data = vec![0xABu8; LARGE_MEDIA_BYTES + 1];
-        let (b64, mime, temp) = media_view_fields(&data, "video/mp4", Some("clip.mp4"));
-        assert!(b64.is_none());
-        assert_eq!(mime.as_deref(), Some("video/mp4"));
-        let path = temp.expect("doveva scrivere un file temporaneo");
-        let written = std::fs::read(&path).unwrap();
-        assert_eq!(written, data);
-        std::fs::remove_file(&path).ok();
-    }
-
-    #[test]
-    fn temp_filename_has_no_directory_traversal_from_embedded_filename() {
-        let path = write_temp_media_file(&[1, 2, 3], Some("../../etc/passwd")).unwrap();
-        assert!(!path.to_string_lossy().contains(".."));
-        std::fs::remove_file(&path).ok();
-    }
-
-    #[test]
-    fn save_temp_media_copies_and_cleans_up_the_source() {
-        let dir = std::env::temp_dir().join("sigillo-test-save-temp-media");
-        std::fs::create_dir_all(&dir).unwrap();
-        let src = dir.join("sorgente.bin");
-        let dest = dir.join("destinazione.bin");
-        std::fs::write(&src, b"contenuto di prova").unwrap();
-
-        save_temp_media(
-            src.to_string_lossy().into_owned(),
-            dest.to_string_lossy().into_owned(),
-        )
-        .unwrap();
-
-        assert_eq!(std::fs::read(&dest).unwrap(), b"contenuto di prova");
-        assert!(!src.exists(), "il file temporaneo va ripulito dopo la copia");
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 }
