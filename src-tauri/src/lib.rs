@@ -1626,6 +1626,359 @@ mod tests {
         assert!(!err.contains("non è indirizzato a te"), "{err}");
     }
 
+    // ---------- Allegati generici: cifratura -> decifratura, di punta a punta ----------
+    //
+    // Gli stessi passaggi dei comandi (encrypt_payload_to_file,
+    // decrypt_streaming_with_any_cert, process_plaintext), con file veri su
+    // disco e cifratura vera, meno il solo collante di Tauri (AppHandle,
+    // impostazioni, finestra).
+
+    fn pseudo_random_bytes(len: usize, seed: u64) -> Vec<u8> {
+        let mut state = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (0..len)
+            .map(|_| {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                (state >> 33) as u8
+            })
+            .collect()
+    }
+
+    fn write_source(dir: &std::path::Path, name: &str, content: &[u8]) -> SourceFile {
+        let path = dir.join(name);
+        std::fs::write(&path, content).unwrap();
+        open_source_file(path.to_str().unwrap()).unwrap()
+    }
+
+    /// Cifra `file` (+ `text`) per `recipient` come fa il comando
+    /// corrispondente, e restituisce il percorso del file cifrato.
+    fn encrypt_like_the_commands(
+        dir: &std::path::Path,
+        sender: &identity::Identity,
+        recipient: &identity::Identity,
+        text: Option<&str>,
+        file: &SourceFile,
+        sign: bool,
+        armor: bool,
+        timelock_height: Option<u32>,
+    ) -> PathBuf {
+        let output = dir.join(format!("{}.cifrato", file.info.name));
+        let recipients = [recipient.cert.clone()];
+        let out = output.to_str().unwrap();
+
+        let (prefix, literal_name) = match (text, timelock_height) {
+            // Solo allegato: nome nel pacchetto OpenPGP, nessun contenitore.
+            (None, None) => (Vec::new(), Some(file.info.name.as_str())),
+            (Some(text), None) => (
+                sigillo_core::composite::encode_header(text, Some(&file.info.name), &file.info.mime, file.info.size).unwrap(),
+                None,
+            ),
+            (text, Some(height)) => {
+                let inner = sigillo_core::composite::encode_header(
+                    text.unwrap_or(""),
+                    Some(&file.info.name),
+                    &file.info.mime,
+                    file.info.size,
+                )
+                .unwrap();
+                let mut prefix = sigillo_core::timelock::encode_header(height, None, inner.len() as u64 + file.info.size).unwrap();
+                prefix.extend_from_slice(&inner);
+                (prefix, None)
+            }
+        };
+        encrypt_payload_to_file(&sender.cert, &recipients, sign, armor, out, literal_name, &prefix, Some(file)).unwrap();
+        assert!(!std::path::Path::new(&format!("{out}.parte")).exists(), "il file provvisorio non deve restare");
+        output
+    }
+
+    fn decrypt_like_the_commands(
+        store: &attachments::AttachmentStore,
+        recipient: &identity::Identity,
+        contacts: &[Cert],
+        cipher_path: &std::path::Path,
+        experimental: bool,
+        fetch: &dyn Fn(&str, bool) -> Result<u32, String>,
+    ) -> Result<message::StreamOutcome<attachments::Processed>, String> {
+        let mut settings = settings::Settings::default();
+        settings.experimental_features_enabled = experimental;
+        let session = attachments::Session::new(store);
+        let path = cipher_path.to_str().unwrap().to_string();
+        let source = CipherSource::File(&path);
+        let outcome = decrypt_streaming_with_any_cert(
+            &[recipient.cert.clone()],
+            contacts,
+            &|| open_cipher_input(&source),
+            &mut |plain, name| attachments::process_plaintext(plain, name, &settings, &session, fetch),
+            &mut || session.rollback(),
+        )?;
+        session.commit();
+        Ok(outcome)
+    }
+
+    fn no_network(_: &str, _: bool) -> Result<u32, String> {
+        panic!("nessuna verifica di rete attesa")
+    }
+
+    #[test]
+    fn every_kind_of_file_round_trips_with_name_size_and_bytes_intact() {
+        let alice = identity::generate(identity::SeedWordCount::Twelve, "Alice").unwrap();
+        let bob = identity::generate(identity::SeedWordCount::Twelve, "Bob").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let store = attachments::AttachmentStore::new(dir.path().join("cache").join("anteprime"));
+
+        let zip = |n| [b"PK\x03\x04".to_vec(), pseudo_random_bytes(n, n as u64)].concat();
+        let cases: Vec<(&str, Vec<u8>, &str)> = vec![
+            ("relazione piccola.pdf", [b"%PDF-1.7\n".to_vec(), pseudo_random_bytes(20_000, 1)].concat(), "pdf"),
+            ("relazione grande.pdf", [b"%PDF-1.7\n".to_vec(), pseudo_random_bytes(6_000_000, 2)].concat(), "pdf"),
+            ("lettera.docx", zip(150_000), "documento"),
+            ("bilancio.xlsx", zip(90_000), "foglio"),
+            ("slide.pptx", zip(300_000), "presentazione"),
+            ("lettera.odt", zip(40_000), "documento"),
+            ("note.txt", "prima riga\nseconda riga, è accentata\n".as_bytes().to_vec(), "testo"),
+            ("tabella.csv", "a;b;c\n1;2;3\n".as_bytes().to_vec(), "foglio"),
+            ("archivio.zip", zip(700_000), "archivio"),
+            ("canzone.mp3", [b"ID3\x03".to_vec(), pseudo_random_bytes(500_000, 3)].concat(), "audio"),
+            ("dati.xyz", pseudo_random_bytes(5_000, 4), "generico"),
+            ("senza_estensione", pseudo_random_bytes(300, 5), "generico"),
+            ("vuoto.bin", Vec::new(), "generico"),
+        ];
+
+        for (name, content, category) in &cases {
+            let file = write_source(dir.path(), name, content);
+            for (text, sign, armor) in [(None, false, true), (None, true, false), (Some("Con un messaggio"), false, true), (Some("Firmato"), true, false)] {
+                let cipher = encrypt_like_the_commands(dir.path(), &alice, &bob, text, &file, sign, armor, None);
+                let alice_public = alice.cert.clone().strip_secret_key_material();
+                let outcome = decrypt_like_the_commands(&store, &bob, &[alice_public], &cipher, false, &no_network).unwrap();
+
+                let processed = outcome.value;
+                let att = processed.attachment.unwrap_or_else(|| panic!("{name}: nessun allegato"));
+                assert_eq!(att.name, *name, "{name}: nome originale");
+                assert_eq!(att.size, content.len() as u64, "{name}: dimensione");
+                assert_eq!(att.category, *category, "{name}: tipo");
+                assert_eq!(std::fs::read(&att.path).unwrap(), *content, "{name}: contenuto");
+                match text {
+                    None => assert_eq!(processed.kind, "allegato", "{name}"),
+                    Some(t) => {
+                        assert_eq!(processed.kind, "combinato", "{name}");
+                        assert_eq!(processed.plaintext.as_deref(), Some(t));
+                    }
+                }
+                assert_eq!(
+                    matches!(outcome.signature, message::SignatureStatus::Verified(_)),
+                    sign,
+                    "{name}: firma"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_attachment_only_message_is_a_plain_openpgp_file_with_its_name() {
+        // Interoperabilita': un file allegato da solo si decifra anche con
+        // un altro programma OpenPGP e ritorna il file originale (qui lo
+        // simuliamo con la decifratura "tutta in memoria" di Sigillo).
+        let alice = identity::generate(identity::SeedWordCount::Twelve, "Alice").unwrap();
+        let bob = identity::generate(identity::SeedWordCount::Twelve, "Bob").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let content = [b"%PDF-1.7\n".to_vec(), pseudo_random_bytes(10_000, 9)].concat();
+        let file = write_source(dir.path(), "contratto.pdf", &content);
+        let cipher = encrypt_like_the_commands(dir.path(), &alice, &bob, None, &file, false, true, None);
+
+        let decrypted = message::decrypt_bytes(&bob.cert, &[], &std::fs::read(cipher).unwrap()).unwrap();
+        assert_eq!(decrypted.data, content, "nessun contenitore Sigillo attorno al file");
+        assert_eq!(decrypted.filename.as_deref(), Some("contratto.pdf"));
+    }
+
+    #[test]
+    fn a_hostile_name_inside_an_encrypted_message_cannot_escape_the_private_folder() {
+        // Un mittente malevolo costruisce un messaggio vero, cifrato per
+        // noi, con un nome file ostile nel contenitore e nel pacchetto.
+        let mallory = identity::generate(identity::SeedWordCount::Twelve, "Mallory").unwrap();
+        let bob = identity::generate(identity::SeedWordCount::Twelve, "Bob").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let store = attachments::AttachmentStore::new(dir.path().join("cache").join("anteprime"));
+
+        for hostile in ["../../fuga.txt", "..\\..\\fuga.txt", "/etc/passwd", "a/../../b.exe", "nul\0.pdf", "\u{202E}fdp.exe"] {
+            for in_container in [true, false] {
+                let body = [b"%PDF-1.7\n".to_vec(), vec![1; 100]].concat();
+                let mut cipher = Vec::new();
+                message::encrypt_to_writer(
+                    &mallory.cert,
+                    &[bob.cert.clone()],
+                    if in_container { None } else { Some(hostile) },
+                    false,
+                    false,
+                    &mut cipher,
+                    |w| {
+                        if in_container {
+                            w.write_all(&sigillo_core::composite::encode("", Some(hostile), "application/pdf", &body).unwrap())?;
+                        } else {
+                            w.write_all(&body)?;
+                        }
+                        Ok(())
+                    },
+                )
+                .or_else(|e| if in_container { Err(e) } else { Ok(()) })
+                .unwrap();
+                if cipher.is_empty() {
+                    continue; // il nome ostile non e' nemmeno ammesso nel pacchetto OpenPGP
+                }
+                let path = dir.path().join("ostile.gpg");
+                std::fs::write(&path, &cipher).unwrap();
+                let outcome = decrypt_like_the_commands(&store, &bob, &[], &path, false, &no_network).unwrap();
+                let att = outcome.value.attachment.unwrap();
+                assert!(store.owns(std::path::Path::new(&att.path)), "{hostile:?}: file fuori dalla cartella privata");
+                assert!(!att.name.contains('/') && !att.name.contains('\\') && !att.name.contains(".."), "{hostile:?} -> {:?}", att.name);
+            }
+        }
+        // Fuori dalla cartella privata non e' comparso nulla.
+        let siblings: Vec<_> = std::fs::read_dir(dir.path().join("cache")).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(siblings, vec![std::ffi::OsString::from("anteprime")]);
+        assert!(!dir.path().join("fuga.txt").exists());
+    }
+
+    #[test]
+    fn messages_made_by_the_previous_versions_still_decrypt() {
+        let alice = identity::generate(identity::SeedWordCount::Twelve, "Alice").unwrap();
+        let bob = identity::generate(identity::SeedWordCount::Twelve, "Bob").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let store = attachments::AttachmentStore::new(dir.path().join("anteprime"));
+        let jpeg = [vec![0xFF, 0xD8, 0xFF, 0xE0], pseudo_random_bytes(3000, 7)].concat();
+        let mut mp4 = vec![0u8; 4];
+        mp4.extend_from_slice(b"ftypisom\0\0\0\0");
+        mp4.extend_from_slice(&pseudo_random_bytes(4000, 8));
+
+        // Cosa produceva v0.5: testo puro, immagine sola (nome nel pacchetto),
+        // video solo, testo + immagine (contenitore), testo + video.
+        let old_messages: Vec<(Vec<u8>, Option<&str>, &str, Option<&str>)> = vec![
+            ("testo di una volta".as_bytes().to_vec(), None, "testo", Some("testo di una volta")),
+            (jpeg.clone(), Some("foto.jpg"), "allegato", None),
+            (mp4.clone(), Some("clip.mp4"), "allegato", None),
+            (sigillo_core::composite::encode("guarda", Some("foto.jpg"), "image/jpeg", &jpeg).unwrap(), None, "combinato", Some("guarda")),
+            (sigillo_core::composite::encode("e un video", Some("clip.mov"), "video/quicktime", &mp4).unwrap(), None, "combinato", Some("e un video")),
+        ];
+        for (index, (plain, name, kind, text)) in old_messages.iter().enumerate() {
+            for armor in [true, false] {
+                let bytes = message::encrypt_bytes(&alice.cert, &[bob.cert.clone()], plain, *name, false, armor).unwrap();
+                let path = dir.path().join(format!("vecchio-{index}-{armor}"));
+                std::fs::write(&path, bytes).unwrap();
+                let outcome = decrypt_like_the_commands(&store, &bob, &[], &path, false, &no_network).unwrap();
+                assert_eq!(outcome.value.kind, *kind, "messaggio {index}");
+                assert_eq!(outcome.value.plaintext.as_deref(), *text, "messaggio {index}");
+                if let Some(att) = &outcome.value.attachment {
+                    let content = if index == 1 || index == 3 { &jpeg } else { &mp4 };
+                    assert_eq!(&std::fs::read(&att.path).unwrap(), content, "messaggio {index}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_tampered_or_truncated_message_never_leaves_decrypted_files_behind() {
+        let alice = identity::generate(identity::SeedWordCount::Twelve, "Alice").unwrap();
+        let bob = identity::generate(identity::SeedWordCount::Twelve, "Bob").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let store = attachments::AttachmentStore::new(dir.path().join("anteprime"));
+        let file = write_source(dir.path(), "segreto.pdf", &[b"%PDF-1.7\n".to_vec(), pseudo_random_bytes(400_000, 3)].concat());
+        let cipher = encrypt_like_the_commands(dir.path(), &alice, &bob, Some("testo"), &file, false, false, None);
+        let good = std::fs::read(&cipher).unwrap();
+
+        let mut tampered = good.clone();
+        let mid = tampered.len() / 2;
+        tampered[mid] ^= 0x01;
+        let truncated = good[..good.len() / 2].to_vec();
+
+        for (label, bytes) in [("manomesso", tampered), ("troncato", truncated)] {
+            let path = dir.path().join(format!("{label}.gpg"));
+            std::fs::write(&path, bytes).unwrap();
+            assert!(
+                decrypt_like_the_commands(&store, &bob, &[], &path, false, &no_network).is_err(),
+                "{label}: non deve risultare valido"
+            );
+            let left = std::fs::read_dir(store.root()).map(|d| d.count()).unwrap_or(0);
+            assert_eq!(left, 0, "{label}: nessun file decifrato deve restare");
+        }
+    }
+
+    #[test]
+    fn a_timelocked_attachment_stays_off_the_disk_until_the_height_is_reached() {
+        let alice = identity::generate(identity::SeedWordCount::Twelve, "Alice").unwrap();
+        let bob = identity::generate(identity::SeedWordCount::Twelve, "Bob").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let store = attachments::AttachmentStore::new(dir.path().join("anteprime"));
+        let content = [b"%PDF-1.7\n".to_vec(), pseudo_random_bytes(50_000, 1)].concat();
+        let file = write_source(dir.path(), "piano.pdf", &content);
+        let cipher = encrypt_like_the_commands(dir.path(), &alice, &bob, Some("apri dopo"), &file, false, true, Some(900_000));
+
+        // Altezza non raggiunta: nessun contenuto, niente su disco.
+        let locked = decrypt_like_the_commands(&store, &bob, &[], &cipher, true, &|_, _| Ok(899_999)).unwrap().value;
+        assert_eq!(locked.kind, "bloccato_nel_tempo");
+        assert_eq!((locked.target_height, locked.current_height), (Some(900_000), Some(899_999)));
+        assert!(locked.attachment.is_none() && locked.plaintext.is_none());
+        assert!(!store.root().exists());
+
+        // Funzioni sperimentali spente: nessuna richiesta di rete (no_network
+        // fa fallire il test se parte), il contenuto resta un dato opaco.
+        let opaque = decrypt_like_the_commands(&store, &bob, &[], &cipher, false, &no_network).unwrap().value;
+        assert_ne!(opaque.kind, "bloccato_nel_tempo");
+
+        // Altezza raggiunta: compaiono testo e allegato, identico all'originale.
+        let unlocked = decrypt_like_the_commands(&store, &bob, &[], &cipher, true, &|_, _| Ok(900_000)).unwrap().value;
+        assert_eq!(unlocked.kind, "combinato");
+        assert_eq!(unlocked.plaintext.as_deref(), Some("apri dopo"));
+        let att = unlocked.attachment.unwrap();
+        assert_eq!(att.name, "piano.pdf");
+        assert_eq!(std::fs::read(att.path).unwrap(), content);
+    }
+
+    #[test]
+    fn a_vanished_source_file_does_not_leave_a_half_written_encrypted_file() {
+        let alice = identity::generate(identity::SeedWordCount::Twelve, "Alice").unwrap();
+        let bob = identity::generate(identity::SeedWordCount::Twelve, "Bob").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let file = write_source(dir.path(), "sparisce.pdf", b"%PDF-1.7 corpo");
+        std::fs::remove_file(&file.path).unwrap();
+
+        let output = dir.path().join("risultato.asc");
+        let err = encrypt_payload_to_file(
+            &alice.cert,
+            &[bob.cert.clone()],
+            false,
+            true,
+            output.to_str().unwrap(),
+            Some("sparisce.pdf"),
+            &[],
+            Some(&file),
+        )
+        .unwrap_err();
+        assert!(!err.is_empty());
+        assert!(!output.exists(), "il file di destinazione non va creato");
+        assert!(!dir.path().join("risultato.asc.parte").exists(), "il provvisorio va rimosso");
+    }
+
+    #[test]
+    fn encrypting_over_an_existing_file_replaces_it_only_on_success() {
+        let alice = identity::generate(identity::SeedWordCount::Twelve, "Alice").unwrap();
+        let bob = identity::generate(identity::SeedWordCount::Twelve, "Bob").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("esistente.asc");
+        std::fs::write(&output, b"versione precedente").unwrap();
+
+        // Un tentativo che fallisce (file mancante) lascia intatto il vecchio.
+        let missing = SourceFile {
+            path: dir.path().join("non-esiste.pdf"),
+            info: attachments::AttachmentInfo {
+                name: "non-esiste.pdf".into(),
+                size: 10,
+                mime: "application/pdf".into(),
+                category: "pdf".into(),
+                dangerous: false,
+                too_large: false,
+            },
+        };
+        assert!(encrypt_payload_to_file(&alice.cert, &[bob.cert.clone()], false, true, output.to_str().unwrap(), Some("x.pdf"), &[], Some(&missing)).is_err());
+        assert_eq!(std::fs::read(&output).unwrap(), b"versione precedente");
+    }
+
     // ---------- Time-lock ----------
 
     #[test]

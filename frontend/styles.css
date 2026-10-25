@@ -468,14 +468,14 @@ details summary {
  * regola esplicita impostare .hidden=true su questo elemento non lo
  * nasconderebbe visivamente.
  */
-#image-preview-wrap {
+#attach-preview-wrap {
   display: flex;
   flex-direction: column;
   align-items: center;
   gap: 0.5rem;
 }
 
-#image-preview-wrap[hidden] {
+#attach-preview-wrap[hidden] {
   display: none;
 }
 
@@ -531,7 +531,7 @@ details summary {
   cursor: pointer;
 }
 
-#decrypt-result-image {
+#decrypt-result-attachment {
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -539,8 +539,111 @@ details summary {
   margin-top: 0.75rem;
 }
 
-#decrypt-result-image[hidden] {
+#decrypt-result-attachment[hidden] {
   display: none;
+}
+
+.decrypt-media {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+#decrypt-attachment-body {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 0.5rem;
+  width: 100%;
+  max-width: 460px;
+}
+
+#decrypt-attachment-body[hidden] {
+  display: none;
+}
+
+#decrypt-danger-warning[hidden],
+#decrypt-attachment-actions[hidden],
+#decrypt-progress[hidden] {
+  display: none;
+}
+
+#decrypt-danger-warning p {
+  margin: 0 0 0.25rem;
+}
+
+#decrypt-danger-warning .button-row button.danger {
+  margin-top: 0;
+}
+
+/* Sprite delle icone: fuori schermo, ma non display:none (vedi index.html). */
+.svg-sprite {
+  position: absolute;
+  width: 0;
+  height: 0;
+  overflow: hidden;
+}
+
+/*
+ * Scheda di un file (allegato in "Scrivi", file ricevuto in "Decifra"):
+ * icona del tipo, nome e dimensione. Il colore dell'icona segue la
+ * famiglia del file, cosi' PDF, fogli di calcolo, audio... si
+ * distinguono a colpo d'occhio.
+ */
+.file-card {
+  display: flex;
+  align-items: center;
+  gap: 0.85rem;
+  width: 100%;
+  max-width: 460px;
+  padding: 0.8rem 1rem;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg);
+  text-align: left;
+}
+
+.file-card[hidden] {
+  display: none;
+}
+
+.file-icon {
+  flex: none;
+  width: 2.6rem;
+  height: 2.6rem;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  color: var(--muted);
+}
+
+.file-card[data-category="pdf"] .file-icon { color: #d6453d; }
+.file-card[data-category="documento"] .file-icon { color: #2f6fd6; }
+.file-card[data-category="testo"] .file-icon { color: #5b7186; }
+.file-card[data-category="foglio"] .file-icon { color: #1f9d55; }
+.file-card[data-category="presentazione"] .file-icon { color: #e07a1f; }
+.file-card[data-category="audio"] .file-icon { color: #8a55d6; }
+.file-card[data-category="archivio"] .file-icon { color: #b8860b; }
+.file-card[data-category="immagine"] .file-icon,
+.file-card[data-category="video"] .file-icon { color: var(--accent); }
+
+.file-card-body {
+  min-width: 0;
+  flex: 1;
+}
+
+.file-card-name {
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.file-card-meta {
+  color: var(--muted);
+  font-size: 0.88rem;
+  margin-top: 0.15rem;
 }
 
 .contact-list {
