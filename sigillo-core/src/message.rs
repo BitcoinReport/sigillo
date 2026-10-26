@@ -36,6 +36,29 @@ pub fn encrypt_bytes(
     sign: bool,
     armor: bool,
 ) -> Result<Vec<u8>> {
+    let mut sink = Vec::new();
+    encrypt_to_writer(sender, recipients, filename, sign, armor, &mut sink, |w| {
+        w.write_all(data)?;
+        Ok(())
+    })?;
+    Ok(sink)
+}
+
+/// Come [`encrypt_bytes`], ma "a flusso": il contenuto non viene
+/// passato tutto insieme ma scritto da `write_body` direttamente nel
+/// messaggio OpenPGP mentre si cifra, e il risultato va a `out` (tipicamente
+/// un file) invece di accumularsi in memoria. È ciò che permette di
+/// cifrare un allegato da centinaia di MB senza tenerne in RAM più di
+/// qualche kilobyte alla volta.
+pub fn encrypt_to_writer<W: Write + Send + Sync>(
+    sender: &Cert,
+    recipients: &[Cert],
+    filename: Option<&str>,
+    sign: bool,
+    armor: bool,
+    out: W,
+    write_body: impl FnOnce(&mut dyn Write) -> Result<()>,
+) -> Result<()> {
     let p = &StandardPolicy::new();
 
     let mut recipient_keys = Vec::new();
@@ -63,48 +86,45 @@ pub fn encrypt_bytes(
         anyhow::bail!("nessun destinatario selezionato");
     }
 
-    let mut sink = Vec::new();
-    {
-        let message = Message::new(&mut sink);
-        let message: Message = if armor {
-            Armorer::new(message).build()?
-        } else {
-            message
-        };
-        let message = Encryptor2::for_recipients(message, recipient_keys).build()?;
+    let message = Message::new(out);
+    let message: Message = if armor {
+        Armorer::new(message).build()?
+    } else {
+        message
+    };
+    let message = Encryptor2::for_recipients(message, recipient_keys).build()?;
 
-        let message = if sign {
-            let signing_keypair = sender
-                .keys()
-                .secret()
-                .with_policy(p, None)
-                .supported()
-                .alive()
-                .revoked(false)
-                .for_signing()
-                .next()
-                .context("la tua identità non ha una chiave di firma valida")?
-                .key()
-                .clone()
-                .into_keypair()
-                .context("impossibile usare la tua chiave per firmare")?;
-            Signer::new(message, signing_keypair).build()?
-        } else {
-            message
-        };
+    let message = if sign {
+        let signing_keypair = sender
+            .keys()
+            .secret()
+            .with_policy(p, None)
+            .supported()
+            .alive()
+            .revoked(false)
+            .for_signing()
+            .next()
+            .context("la tua identità non ha una chiave di firma valida")?
+            .key()
+            .clone()
+            .into_keypair()
+            .context("impossibile usare la tua chiave per firmare")?;
+        Signer::new(message, signing_keypair).build()?
+    } else {
+        message
+    };
 
-        let mut literal = LiteralWriter::new(message);
-        literal = if let Some(name) = filename {
-            literal.filename(name).context("nome file non valido")?.format(DataFormat::Binary)
-        } else {
-            literal.format(DataFormat::Unicode)
-        };
-        let mut message = literal.build()?;
-        message.write_all(data)?;
-        message.finalize()?;
-    }
+    let mut literal = LiteralWriter::new(message);
+    literal = if let Some(name) = filename {
+        literal.filename(name).context("nome file non valido")?.format(DataFormat::Binary)
+    } else {
+        literal.format(DataFormat::Unicode)
+    };
+    let mut message = literal.build()?;
+    write_body(&mut message)?;
+    message.finalize()?;
 
-    Ok(sink)
+    Ok(())
 }
 
 /// Cifra `plaintext` per uno o più destinatari, con firma opzionale del
@@ -149,7 +169,9 @@ struct Helper<'a> {
     contacts: &'a [Cert],
     found_matching_key: Rc<RefCell<bool>>,
     signature: SignatureStatus,
-    filename: Option<String>,
+    /// Condiviso con chi decifra "a flusso", che puo' leggere il nome
+    /// file non appena il pacchetto dei dati letterali e' stato visto.
+    filename: Rc<RefCell<Option<String>>>,
 }
 
 impl<'a> VerificationHelper for Helper<'a> {
@@ -185,7 +207,7 @@ impl<'a> VerificationHelper for Helper<'a> {
     fn inspect(&mut self, pp: &PacketParser) -> Result<()> {
         if let Packet::Literal(lit) = &pp.packet {
             if let Some(name) = lit.filename() {
-                self.filename = Some(String::from_utf8_lossy(name).into_owned());
+                *self.filename.borrow_mut() = Some(String::from_utf8_lossy(name).into_owned());
             }
         }
         Ok(())
@@ -256,7 +278,7 @@ fn decrypt_raw(
         contacts,
         found_matching_key: found_matching_key.clone(),
         signature: SignatureStatus::Unsigned,
-        filename: None,
+        filename: Rc::new(RefCell::new(None)),
     };
 
     let mut decryptor = DecryptorBuilder::from_bytes(input)
@@ -279,7 +301,86 @@ fn decrypt_raw(
         .context("errore durante la lettura del contenuto decifrato")?;
 
     let helper = decryptor.into_helper();
-    Ok((data, helper.filename, helper.signature))
+    let filename = helper.filename.borrow().clone();
+    Ok((data, filename, helper.signature))
+}
+
+/// Esito di una decifratura "a flusso" (vedi [`decrypt_streaming`]).
+pub struct StreamOutcome<T> {
+    /// Quello che ha restituito la funzione che ha consumato il flusso.
+    pub value: T,
+    /// Nome file incorporato nel messaggio, se c'era.
+    pub filename: Option<String>,
+    pub signature: SignatureStatus,
+}
+
+/// Decifra `input` "a flusso": invece di restituire tutto il contenuto in
+/// memoria, passa a `consume` un lettore dei byte decifrati, che puo'
+/// copiarli direttamente su file. `consume` riceve anche una funzione
+/// per leggere il nome file incorporato (disponibile dopo la lettura dei
+/// primi byte).
+///
+/// Quando `consume` ha finito, il resto del flusso viene letto comunque
+/// fino in fondo: e' solo alla fine che il messaggio risulta autenticato
+/// (controllo di integrita' e firma), quindi un contenuto manomesso o
+/// troncato produce un errore e non viene mai dato per buono. Chi chiama
+/// deve perciò considerare il risultato valido solo se questa funzione
+/// restituisce `Ok`, e scartare qualunque file scritto in `consume`
+/// altrimenti.
+pub fn decrypt_streaming<R, T, F>(
+    identity: &Cert,
+    contacts: &[Cert],
+    input: R,
+    consume: F,
+) -> Result<StreamOutcome<T>>
+where
+    R: std::io::Read + Send + Sync,
+    F: FnOnce(&mut dyn std::io::Read, &dyn Fn() -> Option<String>) -> Result<T>,
+{
+    let p = &StandardPolicy::new();
+    let found_matching_key = Rc::new(RefCell::new(false));
+    let filename = Rc::new(RefCell::new(None));
+
+    let helper = Helper {
+        identity,
+        contacts,
+        found_matching_key: found_matching_key.clone(),
+        signature: SignatureStatus::Unsigned,
+        filename: filename.clone(),
+    };
+
+    let mut decryptor = DecryptorBuilder::from_reader(input)
+        .context("il contenuto non è un messaggio OpenPGP valido, o è danneggiato")?
+        .with_policy(p, None, helper)
+        .map_err(|_| {
+            if *found_matching_key.borrow() {
+                anyhow::anyhow!(
+                    "impossibile decifrare il messaggio: la chiave corrisponde ma il contenuto sembra danneggiato"
+                )
+            } else {
+                anyhow::anyhow!(
+                    "questo messaggio non è indirizzato a te: nessuna delle tue chiavi corrisponde"
+                )
+            }
+        })?;
+
+    let name_reader = {
+        let filename = filename.clone();
+        move || filename.borrow().clone()
+    };
+    let value = consume(&mut decryptor, &name_reader)?;
+
+    // Fino in fondo: e' qui che emergono manomissioni e troncamenti.
+    std::io::copy(&mut decryptor, &mut std::io::sink())
+        .context("errore durante la lettura del contenuto decifrato: il file sembra danneggiato o incompleto")?;
+
+    let helper = decryptor.into_helper();
+    let final_name = filename.borrow().clone();
+    Ok(StreamOutcome {
+        value,
+        filename: final_name,
+        signature: helper.signature,
+    })
 }
 
 /// Decifra un contenuto binario (es. un'immagine cifrata), verificando
