@@ -1,5 +1,6 @@
 pub mod attachment;
 pub mod composite;
+pub mod contact_import;
 pub mod contacts;
 pub mod identity;
 pub mod keyinfo;
