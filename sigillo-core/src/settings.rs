@@ -51,6 +51,10 @@ pub struct Settings {
     /// comunque Tor per essere raggiunto, indipendentemente da
     /// `tor_enabled`.
     pub timelock_custom_endpoint: Option<String>,
+    /// La nota "la ricerca contatta un server pubblico (keys.openpgp.org)"
+    /// si mostra una sola volta, la prima volta che si cerca un contatto
+    /// per fingerprint senza Tor: poi non deve ripresentarsi.
+    pub keyserver_note_shown: bool,
 }
 
 impl Default for Settings {
@@ -62,6 +66,7 @@ impl Default for Settings {
             tor_socks_host: "127.0.0.1".to_string(),
             tor_socks_port: 9050,
             timelock_custom_endpoint: None,
+            keyserver_note_shown: false,
         }
     }
 }
@@ -146,6 +151,7 @@ mod tests {
         assert_eq!(settings.tor_socks_host, "127.0.0.1");
         assert_eq!(settings.tor_socks_port, 9050);
         assert_eq!(settings.timelock_custom_endpoint, None);
+        assert!(!settings.keyserver_note_shown);
     }
 
     #[test]
@@ -187,5 +193,6 @@ mod tests {
         assert_eq!(settings.image_format, ImageFormat::Gpg);
         assert!(!settings.experimental_features_enabled);
         assert!(!settings.tor_enabled);
+        assert!(!settings.keyserver_note_shown, "un campo nuovo parte spento");
     }
 }

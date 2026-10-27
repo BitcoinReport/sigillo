@@ -1,4 +1,5 @@
 mod attachments;
+mod keyserver;
 
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -467,6 +468,7 @@ struct AppSettingsView {
     tor_socks_host: String,
     tor_socks_port: u16,
     timelock_custom_endpoint: Option<String>,
+    keyserver_note_shown: bool,
 }
 
 impl From<settings::Settings> for AppSettingsView {
@@ -477,6 +479,7 @@ impl From<settings::Settings> for AppSettingsView {
             tor_socks_host: s.tor_socks_host,
             tor_socks_port: s.tor_socks_port,
             timelock_custom_endpoint: s.timelock_custom_endpoint,
+            keyserver_note_shown: s.keyserver_note_shown,
         }
     }
 }
@@ -799,32 +802,279 @@ fn load_contacts(app: AppHandle) -> Result<Vec<ContactView>, String> {
     saved.iter().map(contact_view).collect()
 }
 
-/// Aggiunge un contatto alla rubrica e lo salva subito su disco (le
-/// chiavi pubbliche dei contatti non sono materiale segreto come la
-/// chiave privata dell'utente, ma vanno comunque persistite: senza
-/// questo la rubrica si svuoterebbe ad ogni riavvio). Foto, email,
-/// telefono e note si aggiungono in un secondo momento dalla scheda
-/// dettaglio del contatto (vedi `update_contact`).
-#[tauri::command]
-fn add_contact(
-    app: AppHandle,
-    name: String,
-    armored_public_key: String,
-) -> Result<ContactView, String> {
-    // Valida la chiave prima di scrivere qualunque cosa su disco.
-    contacts::import_public_key(armored_public_key.as_bytes()).map_err(|e| e.to_string())?;
+// ---------- Aggiungere un contatto: fingerprint, file o testo ----------
 
-    let path = contacts_path(&app)?;
-    let mut book = contacts::load_address_book(&path).map_err(|e| e.to_string())?;
+/// Una chiave trovata, pronta per la schermata di conferma. La chiave
+/// vera e propria viaggia come testo armored (solo parte pubblica); il
+/// resto serve a mostrarla in modo comprensibile.
+#[derive(Serialize)]
+struct ContactCandidate {
+    armored_public_key: String,
+    fingerprint_plain: String,
+    fingerprint_spaced: String,
+    fingerprint_words: Vec<String>,
+    name: Option<String>,
+    email: Option<String>,
+    created_unix: i64,
+    expires_unix: Option<i64>,
+    /// "valida", "scaduta", "revocata" o "senza_cifratura".
+    status: String,
+    /// Il nome con cui lo stesso contatto (stesso fingerprint) e' gia'
+    /// in rubrica, se c'e'.
+    existing_contact_name: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ImportResult {
+    /// Il contenuto includeva una chiave PRIVATA: nulla e' stato importato.
+    private_key: bool,
+    candidates: Vec<ContactCandidate>,
+}
+
+fn key_status_label(status: sigillo_core::contact_import::KeyStatus) -> &'static str {
+    use sigillo_core::contact_import::KeyStatus;
+    match status {
+        KeyStatus::Valid => "valida",
+        KeyStatus::Expired => "scaduta",
+        KeyStatus::Revoked => "revocata",
+        KeyStatus::NoEncryptionKey => "senza_cifratura",
+    }
+}
+
+fn fingerprint_of_saved(saved: &contacts::SavedContact) -> Option<String> {
+    contacts::import_public_key(saved.public_key_armored.as_bytes())
+        .ok()
+        .map(|cert| cert.fingerprint().to_hex())
+}
+
+fn candidates_from_certs(
+    certs: &[Cert],
+    book: &[contacts::SavedContact],
+) -> Result<Vec<ContactCandidate>, String> {
+    let existing: Vec<(String, String)> = book
+        .iter()
+        .filter_map(|c| fingerprint_of_saved(c).map(|fp| (fp, c.name.clone())))
+        .collect();
+
+    certs
+        .iter()
+        .map(|cert| {
+            let summary = sigillo_core::contact_import::summarize(cert, std::time::SystemTime::now());
+            let existing_contact_name = existing
+                .iter()
+                .find(|(fp, _)| *fp == summary.fingerprint_plain)
+                .map(|(_, name)| name.clone());
+            Ok(ContactCandidate {
+                armored_public_key: sigillo_core::contact_import::public_armored(cert)
+                    .map_err(|e| e.to_string())?,
+                fingerprint_plain: summary.fingerprint_plain,
+                fingerprint_spaced: summary.fingerprint_spaced,
+                fingerprint_words: summary.words.into_iter().map(str::to_string).collect(),
+                name: summary.name,
+                email: summary.email,
+                created_unix: summary.created_unix,
+                expires_unix: summary.expires_unix,
+                status: key_status_label(summary.status).to_string(),
+                existing_contact_name,
+            })
+        })
+        .collect()
+}
+
+fn import_result_from_parsed(
+    app: &AppHandle,
+    parsed: sigillo_core::contact_import::ParsedKeys,
+) -> Result<ImportResult, String> {
+    if parsed.found_private {
+        return Ok(ImportResult {
+            private_key: true,
+            candidates: Vec::new(),
+        });
+    }
+    let book = contacts::load_address_book(&contacts_path(app)?).map_err(|e| e.to_string())?;
+    Ok(ImportResult {
+        private_key: false,
+        candidates: candidates_from_certs(&parsed.public, &book)?,
+    })
+}
+
+/// Cerca la chiave di una persona dal suo fingerprint su keys.openpgp.org.
+///
+/// - Il fingerprint si accetta in qualunque forma di scrittura; gli
+///   identificativi corti (8/16 caratteri) si rifiutano.
+/// - La chiave scaricata si accetta solo se ha ESATTAMENTE il fingerprint
+///   richiesto (il server non e' mai una fonte di verita').
+/// - Con Tor attivo la richiesta passa da Tor e, se Tor non risponde,
+///   fallisce: non c'e' mai un ripiego su una connessione diretta.
+#[tauri::command]
+async fn search_contact_by_fingerprint(
+    app: AppHandle,
+    fingerprint: String,
+) -> Result<ImportResult, String> {
+    run_blocking(move || {
+        let fingerprint_plain = sigillo_core::contact_import::normalize_fingerprint(&fingerprint)
+            .map_err(|e| e.user_message())?;
+        let settings = settings::load_settings(&settings_path(&app)?).map_err(|e| e.to_string())?;
+
+        let (route, connect, total) = if settings.tor_enabled {
+            (
+                keyserver::Route::Tor {
+                    host: settings.tor_socks_host.clone(),
+                    port: settings.tor_socks_port,
+                },
+                std::time::Duration::from_secs(TOR_CONNECT_TIMEOUT_SECS),
+                std::time::Duration::from_secs(TOR_TOTAL_TIMEOUT_SECS),
+            )
+        } else {
+            (
+                keyserver::Route::Direct,
+                std::time::Duration::from_secs(CLEARNET_HTTP_TIMEOUT_SECS),
+                std::time::Duration::from_secs(CLEARNET_HTTP_TIMEOUT_SECS),
+            )
+        };
+
+        // La nota "la ricerca contatta un server pubblico" si mostra una
+        // sola volta: la prima ricerca che parte davvero senza Tor la
+        // segna come vista.
+        if !settings.tor_enabled && !settings.keyserver_note_shown {
+            let mut updated = settings.clone();
+            updated.keyserver_note_shown = true;
+            let _ = settings::save_settings(&settings_path(&app)?, &updated);
+        }
+
+        let cert = keyserver::fetch_verified_key(
+            keyserver::KEYSERVER_BASE,
+            &fingerprint_plain,
+            &route,
+            connect,
+            total,
+        )
+        .map_err(|e| e.user_message())?;
+
+        import_result_from_parsed(
+            &app,
+            sigillo_core::contact_import::ParsedKeys {
+                public: vec![cert],
+                found_private: false,
+            },
+        )
+    })
+    .await
+}
+
+/// Legge una o piu' chiavi pubbliche da un file (armored o binario, di
+/// qualunque estensione: si guarda il contenuto). Una chiave PRIVATA non
+/// si importa mai: il risultato lo segnala e il contenuto del file viene
+/// cancellato dalla memoria.
+#[tauri::command]
+async fn read_contact_file(app: AppHandle, path: String) -> Result<ImportResult, String> {
+    run_blocking(move || {
+        use std::io::Read;
+        let file = std::fs::File::open(&path).map_err(|e| format!("impossibile aprire il file: {e}"))?;
+        let mut data = Vec::new();
+        file.take(sigillo_core::contact_import::MAX_KEY_FILE_BYTES as u64 + 1)
+            .read_to_end(&mut data)
+            .map_err(|e| format!("impossibile leggere il file: {e}"))?;
+        let parsed = sigillo_core::contact_import::parse_keys_and_wipe(data)
+            .map_err(|_| "Questo file non contiene una chiave pubblica valida.".to_string())?;
+        import_result_from_parsed(&app, parsed)
+    })
+    .await
+}
+
+/// Come [`read_contact_file`], per il testo della chiave incollato.
+#[tauri::command]
+fn read_contact_text(app: AppHandle, text: String) -> Result<ImportResult, String> {
+    let parsed = sigillo_core::contact_import::parse_keys_and_wipe(text.into_bytes())
+        .map_err(|_| "Questo testo non contiene una chiave pubblica valida.".to_string())?;
+    import_result_from_parsed(&app, parsed)
+}
+
+#[derive(Serialize)]
+struct AddContactOutcome {
+    /// "aggiunto", "aggiornato" (era gia' in rubrica e si sono aggiornati
+    /// nome/note) o "gia_presente" (era gia' in rubrica, niente da fare).
+    status: String,
+    contact: ContactView,
+}
+
+/// Il cuore di [`confirm_add_contact`], senza disco ne' Tauri (per poterlo
+/// provare): aggiunge `armored_public_key` a `book`, senza mai duplicare un
+/// contatto con lo stesso fingerprint. Restituisce lo stato e la voce
+/// toccata.
+fn add_to_book(
+    book: &mut Vec<contacts::SavedContact>,
+    name: &str,
+    armored_public_key: &str,
+    email: Option<String>,
+    notes: Option<String>,
+    update_existing: bool,
+) -> Result<(&'static str, contacts::SavedContact), String> {
+    // Valida la chiave (e rifiuta le chiavi private) prima di toccare
+    // qualunque cosa.
+    let cert = contacts::import_public_key(armored_public_key.as_bytes()).map_err(|e| e.to_string())?;
+    let canonical = sigillo_core::contact_import::public_armored(&cert).map_err(|e| e.to_string())?;
+    let fingerprint = cert.fingerprint().to_hex();
+
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err("Scrivi un nome per questo contatto.".to_string());
+    }
+    let email = normalize_optional(email);
+    let notes = normalize_optional(notes);
+
+    if let Some(index) = book
+        .iter()
+        .position(|c| fingerprint_of_saved(c).as_deref() == Some(fingerprint.as_str()))
+    {
+        if !update_existing {
+            return Ok(("gia_presente", book[index].clone()));
+        }
+        let entry = &mut book[index];
+        entry.name = name;
+        if email.is_some() {
+            entry.email = email;
+        }
+        if notes.is_some() {
+            entry.notes = notes;
+        }
+        return Ok(("aggiornato", entry.clone()));
+    }
+
     let entry = contacts::SavedContact {
         name,
-        public_key_armored: armored_public_key,
+        public_key_armored: canonical,
+        email,
+        notes,
         ..Default::default()
     };
     book.push(entry.clone());
-    contacts::save_address_book(&path, &book).map_err(|e| e.to_string())?;
+    Ok(("aggiunto", entry))
+}
 
-    contact_view(&entry)
+/// Salva il contatto confermato dall'utente. Un contatto con lo stesso
+/// fingerprint non si duplica mai: se c'e' gia' si aggiorna (solo su
+/// richiesta) oppure si lascia com'e'. Si salva la sola parte pubblica
+/// della chiave. Foto e telefono si aggiungono poi dalla scheda dettaglio.
+#[tauri::command]
+fn confirm_add_contact(
+    app: AppHandle,
+    name: String,
+    armored_public_key: String,
+    email: Option<String>,
+    notes: Option<String>,
+    update_existing: bool,
+) -> Result<AddContactOutcome, String> {
+    let path = contacts_path(&app)?;
+    let mut book = contacts::load_address_book(&path).map_err(|e| e.to_string())?;
+    let (status, entry) = add_to_book(&mut book, &name, &armored_public_key, email, notes, update_existing)?;
+    if status != "gia_presente" {
+        contacts::save_address_book(&path, &book).map_err(|e| e.to_string())?;
+    }
+    Ok(AddContactOutcome {
+        status: status.to_string(),
+        contact: contact_view(&entry)?,
+    })
 }
 
 /// Aggiorna nome, foto e dettagli facoltativi (email, telefono, note)
@@ -1475,7 +1725,10 @@ pub fn run() {
             set_active_identity,
             remove_identity_from_disk,
             load_contacts,
-            add_contact,
+            search_contact_by_fingerprint,
+            read_contact_file,
+            read_contact_text,
+            confirm_add_contact,
             update_contact,
             my_technical_details,
             contact_technical_details,
@@ -1977,6 +2230,133 @@ mod tests {
         };
         assert!(encrypt_payload_to_file(&alice.cert, &[bob.cert.clone()], false, true, output.to_str().unwrap(), Some("x.pdf"), &[], Some(&missing)).is_err());
         assert_eq!(std::fs::read(&output).unwrap(), b"versione precedente");
+    }
+
+    // ---------- Aggiungere un contatto ----------
+
+    fn public_armored_of(id: &identity::Identity) -> String {
+        sigillo_core::contact_import::public_armored(&id.cert).unwrap()
+    }
+
+    #[test]
+    fn a_new_contact_is_added_with_only_the_public_part() {
+        let giulia = identity::generate(identity::SeedWordCount::Twelve, "Giulia").unwrap();
+        let mut book = Vec::new();
+        let (status, entry) = add_to_book(&mut book, "  Giulia R.  ", &public_armored_of(&giulia), Some(" giulia@esempio.it ".into()), Some("".into()), false).unwrap();
+        assert_eq!(status, "aggiunto");
+        assert_eq!(book.len(), 1);
+        assert_eq!(entry.name, "Giulia R.");
+        assert_eq!(entry.email.as_deref(), Some("giulia@esempio.it"));
+        assert_eq!(entry.notes, None, "una nota vuota non si salva");
+        assert!(!entry.public_key_armored.contains("PRIVATE"));
+    }
+
+    #[test]
+    fn the_same_contact_is_never_added_twice() {
+        let giulia = identity::generate(identity::SeedWordCount::Twelve, "Giulia").unwrap();
+        let mut book = Vec::new();
+        add_to_book(&mut book, "Giulia", &public_armored_of(&giulia), None, None, false).unwrap();
+
+        // Stessa chiave, scritta in modo diverso (binario -> armored, o
+        // armored con commenti e righe vuote): e' sempre lo stesso fingerprint.
+        let public = giulia.cert.clone().strip_secret_key_material();
+        let as_binary_roundtrip = sigillo_core::contact_import::public_armored(
+            &sigillo_core::contact_import::parse_keys(&sequoia_openpgp::serialize::SerializeInto::to_vec(&public).unwrap()).unwrap().public[0],
+        )
+        .unwrap();
+        let with_noise = format!("\n\nEcco la mia chiave:\n{}\n", public_armored_of(&giulia));
+        for variant in [as_binary_roundtrip, with_noise] {
+            let parsed = sigillo_core::contact_import::parse_keys(variant.as_bytes()).unwrap();
+            let armored = sigillo_core::contact_import::public_armored(&parsed.public[0]).unwrap();
+            let (status, _) = add_to_book(&mut book, "Giulia di nuovo", &armored, None, None, false).unwrap();
+            assert_eq!(status, "gia_presente");
+            assert_eq!(book.len(), 1, "nessun doppione");
+            assert_eq!(book[0].name, "Giulia", "senza richiesta non si cambia nulla");
+        }
+    }
+
+    #[test]
+    fn an_existing_contact_can_be_updated_on_request() {
+        let giulia = identity::generate(identity::SeedWordCount::Twelve, "Giulia").unwrap();
+        let mut book = Vec::new();
+        add_to_book(&mut book, "Giulia", &public_armored_of(&giulia), Some("vecchia@esempio.it".into()), Some("nota vecchia".into()), false).unwrap();
+        book[0].phone = Some("+39 333 1234567".into());
+        book[0].photo_base64 = Some("AAAA".into());
+
+        let (status, entry) = add_to_book(&mut book, "Giulia Rossi", &public_armored_of(&giulia), None, Some("nota nuova".into()), true).unwrap();
+        assert_eq!(status, "aggiornato");
+        assert_eq!(book.len(), 1);
+        assert_eq!(entry.name, "Giulia Rossi");
+        assert_eq!(entry.notes.as_deref(), Some("nota nuova"));
+        assert_eq!(entry.email.as_deref(), Some("vecchia@esempio.it"), "un campo non indicato non si cancella");
+        assert_eq!(book[0].phone.as_deref(), Some("+39 333 1234567"), "telefono e foto restano");
+        assert_eq!(book[0].photo_base64.as_deref(), Some("AAAA"));
+    }
+
+    #[test]
+    fn two_people_with_the_same_name_stay_two_contacts() {
+        // Il backend non decide al posto dell'utente: l'avviso sul "possibile
+        // tentativo di sostituzione" lo fa la schermata di conferma.
+        let a = identity::generate(identity::SeedWordCount::Twelve, "Mario").unwrap();
+        let b = identity::generate(identity::SeedWordCount::TwentyFour, "Mario").unwrap();
+        let mut book = Vec::new();
+        add_to_book(&mut book, "Mario", &public_armored_of(&a), None, None, false).unwrap();
+        let (status, _) = add_to_book(&mut book, "Mario", &public_armored_of(&b), None, None, false).unwrap();
+        assert_eq!(status, "aggiunto");
+        assert_eq!(book.len(), 2);
+    }
+
+    #[test]
+    fn a_private_key_or_an_empty_name_is_refused_and_nothing_changes() {
+        let giulia = identity::generate(identity::SeedWordCount::Twelve, "Giulia").unwrap();
+        let mut book = Vec::new();
+        let private = serialize_tsk_armored(&giulia.cert).unwrap();
+        assert!(add_to_book(&mut book, "Giulia", &private, None, None, false).is_err());
+        assert!(add_to_book(&mut book, "   ", &public_armored_of(&giulia), None, None, false).is_err());
+        assert!(add_to_book(&mut book, "Giulia", "non e' una chiave", None, None, false).is_err());
+        assert!(book.is_empty());
+    }
+
+    #[test]
+    fn existing_contacts_are_left_intact_and_still_load() {
+        // Una rubrica scritta dalle versioni precedenti (chiave incollata
+        // com'era, senza i campi nuovi) continua a caricarsi, e aggiungere
+        // un contatto non la tocca.
+        let old = identity::generate(identity::SeedWordCount::Twelve, "Vecchio").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("contacts.json");
+        let legacy = serde_json::json!([{ "name": "Vecchio", "public_key_armored": public_armored_of(&old) }]);
+        std::fs::write(&path, legacy.to_string()).unwrap();
+
+        let mut book = contacts::load_address_book(&path).unwrap();
+        assert_eq!(book.len(), 1);
+        let new = identity::generate(identity::SeedWordCount::TwentyFour, "Nuovo").unwrap();
+        add_to_book(&mut book, "Nuovo", &public_armored_of(&new), None, None, false).unwrap();
+        contacts::save_address_book(&path, &book).unwrap();
+
+        let reloaded = contacts::load_address_book(&path).unwrap();
+        assert_eq!(reloaded.len(), 2);
+        assert_eq!(reloaded[0].name, "Vecchio");
+        assert_eq!(reloaded[0].public_key_armored, book[0].public_key_armored);
+        assert_eq!(fingerprint_of_saved(&reloaded[0]).unwrap(), old.cert.fingerprint().to_hex());
+    }
+
+    #[test]
+    fn candidates_say_when_the_contact_is_already_in_the_address_book() {
+        let giulia = identity::generate(identity::SeedWordCount::Twelve, "Giulia").unwrap();
+        let altro = identity::generate(identity::SeedWordCount::TwentyFour, "Altro").unwrap();
+        let mut book = Vec::new();
+        add_to_book(&mut book, "La mia Giulia", &public_armored_of(&giulia), None, None, false).unwrap();
+
+        let certs = [giulia.cert.clone().strip_secret_key_material(), altro.cert.clone().strip_secret_key_material()];
+        let candidates = candidates_from_certs(&certs, &book).unwrap();
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].existing_contact_name.as_deref(), Some("La mia Giulia"));
+        assert_eq!(candidates[1].existing_contact_name, None);
+        assert_eq!(candidates[0].status, "valida");
+        assert_eq!(candidates[0].name.as_deref(), Some("Giulia"));
+        assert_eq!(candidates[0].fingerprint_words.len(), 15);
+        assert!(candidates[0].armored_public_key.starts_with("-----BEGIN PGP PUBLIC KEY BLOCK-----"));
     }
 
     // ---------- Time-lock ----------
