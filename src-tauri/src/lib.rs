@@ -933,6 +933,15 @@ async fn search_contact_by_fingerprint(
             )
         };
 
+        // La nota "la ricerca contatta un server pubblico" si mostra una
+        // sola volta: la prima ricerca che parte davvero senza Tor la
+        // segna come vista.
+        if !settings.tor_enabled && !settings.keyserver_note_shown {
+            let mut updated = settings.clone();
+            updated.keyserver_note_shown = true;
+            let _ = settings::save_settings(&settings_path(&app)?, &updated);
+        }
+
         let cert = keyserver::fetch_verified_key(
             keyserver::KEYSERVER_BASE,
             &fingerprint_plain,
@@ -979,19 +988,6 @@ fn read_contact_text(app: AppHandle, text: String) -> Result<ImportResult, Strin
     let parsed = sigillo_core::contact_import::parse_keys_and_wipe(text.into_bytes())
         .map_err(|_| "Questo testo non contiene una chiave pubblica valida.".to_string())?;
     import_result_from_parsed(&app, parsed)
-}
-
-/// La nota "la ricerca contatta un server pubblico" si mostra una sola
-/// volta: dopo la prima ricerca si segna come vista.
-#[tauri::command]
-fn mark_keyserver_note_shown(app: AppHandle) -> Result<(), String> {
-    let path = settings_path(&app)?;
-    let mut current = settings::load_settings(&path).map_err(|e| e.to_string())?;
-    if !current.keyserver_note_shown {
-        current.keyserver_note_shown = true;
-        settings::save_settings(&path, &current).map_err(|e| e.to_string())?;
-    }
-    Ok(())
 }
 
 #[derive(Serialize)]
@@ -1732,7 +1728,6 @@ pub fn run() {
             search_contact_by_fingerprint,
             read_contact_file,
             read_contact_text,
-            mark_keyserver_note_shown,
             confirm_add_contact,
             update_contact,
             my_technical_details,

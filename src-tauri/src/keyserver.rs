@@ -494,4 +494,32 @@ mod tests {
             assert!(m.contains(".asc"), "{m}");
         }
     }
+
+    // ---------- il vero keys.openpgp.org ----------
+
+    #[test]
+    #[ignore = "richiede Internet: contatta davvero keys.openpgp.org (esegui con `cargo test -- --ignored`)"]
+    fn the_real_keyserver_answers_as_expected() {
+        let (c, t) = (Duration::from_secs(20), Duration::from_secs(20));
+        // La chiave di firma di Sigillo e' pubblicata: si trova, e ha il fingerprint richiesto.
+        let fpr = "1382C05E9772233CC957CA7AFF68AF59F8CEC835";
+        let cert = fetch_verified_key(KEYSERVER_BASE, fpr, &Route::Direct, c, t).unwrap();
+        assert!(contact_import::fingerprint_matches(&cert, fpr));
+        let summary = contact_import::summarize(&cert, std::time::SystemTime::now());
+        assert_eq!(summary.fingerprint_plain, fpr);
+
+        // Un fingerprint che non esiste: "non trovata".
+        let err = fetch_verified_key(KEYSERVER_BASE, &"0".repeat(40), &Route::Direct, c, t).unwrap_err();
+        assert_eq!(err, KeyserverError::NotFound);
+    }
+
+    #[test]
+    #[ignore = "richiede Internet e un demone Tor in ascolto su 127.0.0.1:9050: esegui con `cargo test -- --ignored`"]
+    fn the_real_keyserver_answers_through_a_real_tor_daemon() {
+        let route = Route::Tor { host: "127.0.0.1".into(), port: 9050 };
+        let (c, t) = (Duration::from_secs(90), Duration::from_secs(120));
+        let fpr = "1382C05E9772233CC957CA7AFF68AF59F8CEC835";
+        let cert = fetch_verified_key(KEYSERVER_BASE, fpr, &route, c, t).unwrap();
+        assert!(contact_import::fingerprint_matches(&cert, fpr));
+    }
 }

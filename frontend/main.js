@@ -323,6 +323,7 @@ async function applyIdentitiesList(views, activeIdx) {
       socksPort: settings.tor_socks_port,
       customEndpoint: settings.timelock_custom_endpoint,
     };
+    keyserverNoteShown = !!settings.keyserver_note_shown;
   } catch (err) {
     experimentalFeaturesEnabled = false;
   }
@@ -478,6 +479,10 @@ function resetAppToFirstRunState() {
   document.getElementById("ciphertext-in").value = "";
   document.getElementById("ciphertext-out").value = "";
   document.getElementById("message-text").value = "";
+  document.getElementById("import-fingerprint").value = "";
+  document.getElementById("import-text").value = "";
+  importCandidates = [];
+  importQueue = [];
 }
 
 // ---------- Allegato (scheda "Scrivi") ----------
@@ -620,19 +625,33 @@ document.getElementById("btn-remove-attachment").addEventListener("click", () =>
 // scheda "Scrivi" e' quella attiva, per non "rubare" un drop destinato ad
 // altre parti dell'app.
 getCurrentWebview().onDragDropEvent((event) => {
-  const dropzone = document.getElementById("attach-dropzone");
+  const onMain = document.getElementById("screen-main").classList.contains("active");
+  const onWrite = onMain && document.getElementById("tab-write").classList.contains("active");
+  const onContacts =
+    (onMain && document.getElementById("tab-contacts").classList.contains("active")) ||
+    document.getElementById("screen-add-contact").classList.contains("active");
+
+  const writeZone = document.getElementById("attach-dropzone");
+  const importZone = document.getElementById("import-dropzone");
+  const contactsCard = document.querySelector("#tab-contacts .card");
+
   if (event.payload.type === "over") {
-    if (document.getElementById("tab-write").classList.contains("active")) {
-      dropzone.classList.add("dragover");
+    if (onWrite) writeZone.classList.add("dragover");
+    if (onContacts) {
+      importZone.classList.add("dragover");
+      contactsCard.classList.add("dragover");
     }
     return;
   }
-  dropzone.classList.remove("dragover");
+  writeZone.classList.remove("dragover");
+  importZone.classList.remove("dragover");
+  contactsCard.classList.remove("dragover");
   if (event.payload.type !== "drop") return;
-  if (!document.getElementById("tab-write").classList.contains("active")) return;
 
   const path = event.payload.paths[0];
-  if (path) setAttachment(path);
+  if (!path) return;
+  if (onWrite) setAttachment(path);
+  else if (onContacts) importFromFile(path);
 });
 
 // ---------- Avvio: identità già presente su questo dispositivo? ----------
@@ -918,31 +937,366 @@ for (const btn of document.querySelectorAll(".tab-btn")) {
 
 // ---------- Rubrica ----------
 
-document.getElementById("btn-add-contact").addEventListener("click", async (e) => {
-  setError("contact-error", null);
-  const name = document.getElementById("contact-name").value.trim();
-  const key = document.getElementById("contact-key").value.trim();
-  if (!name || !key) {
-    setError("contact-error", "Inserisci sia il nome che la chiave pubblica.");
+// ---------- Rubrica: aggiungere un contatto ----------
+//
+// Tre modi di arrivare alla chiave di una persona — fingerprint (si
+// scarica da keys.openpgp.org), file (.asc, .gpg...) o testo incollato —
+// e SEMPRE la stessa schermata di conferma prima di salvare.
+
+// La nota "la ricerca contatta un server pubblico" si mostra una sola
+// volta (il backend la segna come vista alla prima ricerca senza Tor).
+let keyserverNoteShown = false;
+
+let importCandidates = []; // chiavi trovate dall'ultima importazione
+let importQueue = []; // quelle scelte da confermare, una alla volta
+let importQueueIndex = 0;
+let importAddedCount = 0;
+let importLastAddedName = null;
+
+function fingerprintPlainOf(contact) {
+  return (contact.fingerprintHex || "").replace(/\s+/g, "").toUpperCase();
+}
+
+async function reloadContacts() {
+  const saved = await invoke("load_contacts");
+  contacts.length = 0;
+  for (const c of saved) contacts.push(contactFromView(c));
+  renderContactList();
+}
+
+function clearImportMessages() {
+  for (const id of ["import-fingerprint-error", "import-file-error", "import-text-error"]) {
+    setError(id, null);
+  }
+  document.getElementById("import-private-warning").hidden = true;
+}
+
+function renderKeyserverNote() {
+  document.getElementById("keyserver-note").hidden = torSettings.enabled || keyserverNoteShown;
+}
+
+function showAddContactScreen() {
+  clearImportMessages();
+  document.getElementById("import-methods").hidden = false;
+  document.getElementById("import-choose").hidden = true;
+  document.getElementById("import-search-progress").hidden = true;
+  renderKeyserverNote();
+  setView("screen-add-contact");
+}
+
+document.getElementById("btn-add-contact").addEventListener("click", () => {
+  document.getElementById("contact-flash").hidden = true;
+  showAddContactScreen();
+});
+
+document.getElementById("btn-close-add-contact").addEventListener("click", () => {
+  importCandidates = [];
+  importQueue = [];
+  setView("screen-main");
+});
+
+// Una chiave PRIVATA non si importa mai: avviso ambra e basta. Il testo
+// incollato si cancella subito dalla casella, per non tenerla a schermo.
+function showPrivateKeyWarning() {
+  document.getElementById("import-private-warning").hidden = false;
+  document.getElementById("import-text").value = "";
+  document.getElementById("import-private-warning").scrollIntoView?.({ block: "nearest" });
+}
+
+function handleImportResult(result, errorId) {
+  if (result.private_key) {
+    showPrivateKeyWarning();
+    return;
+  }
+  if (!result.candidates || result.candidates.length === 0) {
+    setError(errorId, "Non ho trovato nessuna chiave in questo contenuto.");
+    return;
+  }
+  importCandidates = result.candidates;
+  if (importCandidates.length === 1) {
+    startConfirmation([0]);
+  } else {
+    showChooser();
+  }
+}
+
+// ---- Più chiavi nello stesso file: si sceglie quali importare ----
+
+function showChooser() {
+  const list = document.getElementById("import-choose-list");
+  list.innerHTML = "";
+  importCandidates.forEach((cand, i) => {
+    const label = document.createElement("label");
+    label.className = "import-choose-item";
+    const box = document.createElement("input");
+    box.type = "checkbox";
+    box.checked = true;
+    box.value = String(i);
+    const text = document.createElement("span");
+    const who = document.createElement("span");
+    who.className = "who";
+    who.textContent = [cand.name, cand.email && `<${cand.email}>`].filter(Boolean).join(" ") || "(senza nome)";
+    const fp = document.createElement("span");
+    fp.className = "fp";
+    fp.textContent = cand.fingerprint_spaced;
+    text.append(who, document.createElement("br"), fp);
+    label.append(box, text);
+    list.appendChild(label);
+  });
+  document.getElementById("import-choose-title").textContent =
+    `Ho trovato ${importCandidates.length} chiavi: quali vuoi aggiungere?`;
+  document.getElementById("import-methods").hidden = true;
+  document.getElementById("import-choose").hidden = false;
+}
+
+document.getElementById("btn-choose-back").addEventListener("click", () => {
+  importCandidates = [];
+  showAddContactScreen();
+});
+
+document.getElementById("btn-choose-continue").addEventListener("click", () => {
+  const chosen = [...document.querySelectorAll("#import-choose-list input:checked")].map((b) =>
+    Number(b.value)
+  );
+  if (chosen.length === 0) return;
+  startConfirmation(chosen);
+});
+
+// ---- Schermata di conferma (comune ai tre metodi) ----
+
+function startConfirmation(indexes) {
+  importQueue = indexes.map((i) => importCandidates[i]);
+  importQueueIndex = 0;
+  importAddedCount = 0;
+  importLastAddedName = null;
+  showConfirmation();
+}
+
+function currentCandidate() {
+  return importQueue[importQueueIndex];
+}
+
+function showConfirmation() {
+  const cand = currentCandidate();
+  setError("confirm-error", null);
+  document.getElementById("confirm-name").value = cand.existing_contact_name || cand.name || "";
+  document.getElementById("confirm-email").value = cand.email || "";
+  document.getElementById("confirm-notes").value = "";
+  document.getElementById("confirm-fingerprint").textContent = cand.fingerprint_spaced;
+  document.getElementById("confirm-fingerprint-words").textContent = cand.fingerprint_words.join("  ");
+  document.getElementById("confirm-created").textContent = formatUnixDate(cand.created_unix);
+  document.getElementById("confirm-expires").textContent = cand.expires_unix
+    ? `${cand.status === "scaduta" ? "è scaduta" : "scade"} il ${formatUnixDate(cand.expires_unix)}`
+    : "non ha scadenza";
+  document.getElementById("confirm-override").checked = false;
+
+  const progress = document.getElementById("confirm-progress");
+  progress.hidden = importQueue.length < 2;
+  progress.textContent = `Contatto ${importQueueIndex + 1} di ${importQueue.length}`;
+
+  refreshConfirmState();
+  setView("screen-confirm-contact");
+}
+
+// Avvisi e stato dei pulsanti: dipendono dalla chiave e, per l'omonimia,
+// dal nome che si sta scrivendo.
+function refreshConfirmState() {
+  const cand = currentCandidate();
+  if (!cand) return;
+
+  const statusBox = document.getElementById("confirm-status-warning");
+  const overrideRow = document.getElementById("confirm-override-row");
+  let blocked = false;
+  let needsOverride = false;
+  let statusText = "";
+  if (cand.status === "revocata") {
+    statusText =
+      "Questa chiave è stata revocata da chi l'ha creata: non è più sicura. Non è consigliato aggiungerla.";
+    needsOverride = true;
+  } else if (cand.status === "scaduta") {
+    statusText = `Questa chiave è scaduta${
+      cand.expires_unix ? ` il ${formatUnixDate(cand.expires_unix)}` : ""
+    }. Non è consigliato usarla: chiedi alla persona una chiave aggiornata.`;
+    needsOverride = true;
+  } else if (cand.status === "senza_cifratura") {
+    statusText =
+      "Questa chiave non può ricevere messaggi cifrati, quindi non è utile come contatto. Chiedi alla persona la sua chiave completa.";
+    blocked = true;
+  }
+  statusBox.hidden = !statusText;
+  statusBox.textContent = statusText;
+  overrideRow.hidden = !needsOverride;
+
+  const dup = document.getElementById("confirm-duplicate");
+  if (cand.existing_contact_name) {
+    dup.hidden = false;
+    dup.textContent = `Hai già questo contatto: «${cand.existing_contact_name}». Non lo aggiungo una seconda volta; se vuoi, puoi aggiornare il nome e le note.`;
+  } else {
+    dup.hidden = true;
+  }
+
+  // Stesso nome ma fingerprint diverso: evidente, perché potrebbe essere
+  // un tentativo di sostituzione (o semplicemente una chiave cambiata).
+  const typed = document.getElementById("confirm-name").value.trim().toLowerCase();
+  const same = typed
+    ? contacts.find(
+        (c) =>
+          c.name.trim().toLowerCase() === typed && fingerprintPlainOf(c) !== cand.fingerprint_plain
+      )
+    : null;
+  const sameBox = document.getElementById("confirm-samename");
+  sameBox.hidden = !same;
+  if (same) {
+    sameBox.textContent = `Attenzione: hai già un contatto chiamato «${same.name}» con un fingerprint DIVERSO. Può essere una persona omonima, una chiave che è cambiata oppure un tentativo di sostituzione: verifica con la persona prima di procedere.`;
+  }
+
+  const addBtn = document.getElementById("btn-confirm-add");
+  addBtn.textContent = cand.existing_contact_name ? "Aggiorna contatto" : "Aggiungi a Rubrica";
+  addBtn.disabled =
+    blocked || (needsOverride && !document.getElementById("confirm-override").checked);
+}
+
+document.getElementById("confirm-name").addEventListener("input", refreshConfirmState);
+document.getElementById("confirm-override").addEventListener("change", refreshConfirmState);
+
+function nextInQueueOrFinish() {
+  importQueueIndex += 1;
+  if (importQueueIndex < importQueue.length) {
+    showConfirmation();
+    return;
+  }
+  if (importAddedCount > 0) {
+    const flash = document.getElementById("contact-flash");
+    flash.textContent =
+      importAddedCount === 1 && importLastAddedName
+        ? importLastAddedName
+        : `${importAddedCount} contatti aggiunti alla rubrica.`;
+    flash.hidden = false;
+    importCandidates = [];
+    importQueue = [];
+    document.getElementById("import-fingerprint").value = "";
+    document.getElementById("import-text").value = "";
+    setView("screen-main");
+  } else {
+    showAddContactScreen();
+  }
+}
+
+document.getElementById("btn-confirm-add").addEventListener("click", async (e) => {
+  const cand = currentCandidate();
+  if (!cand) return;
+  setError("confirm-error", null);
+  const name = document.getElementById("confirm-name").value.trim();
+  if (!name) {
+    setError("confirm-error", "Scrivi un nome per questo contatto.");
     return;
   }
   try {
-    const view = await withLoading(e.currentTarget, () =>
-      invoke("add_contact", { name, armoredPublicKey: key })
+    const outcome = await withLoading(e.currentTarget, () =>
+      invoke("confirm_add_contact", {
+        name,
+        armoredPublicKey: cand.armored_public_key,
+        email: document.getElementById("confirm-email").value,
+        notes: document.getElementById("confirm-notes").value,
+        updateExisting: !!cand.existing_contact_name,
+      })
     );
-    contacts.push(contactFromView(view));
-    renderContactList();
-
-    const hintPanel = document.getElementById("contact-added-hint");
-    hintPanel.querySelector("p:first-child").textContent =
-      `${name} aggiunto/a. Per essere sicuro che sia davvero ${name} (e non qualcuno che finge di esserlo), leggi a voce queste parole a ${name} e verifica che corrispondano a quelle che vede anche ${name}:`;
-    hintPanel.querySelector(".fingerprint-words").textContent = view.fingerprint_words.join("  ");
-    hintPanel.hidden = false;
-
-    document.getElementById("contact-name").value = "";
-    document.getElementById("contact-key").value = "";
+    await reloadContacts();
+    importAddedCount += 1;
+    importLastAddedName =
+      outcome.status === "aggiornato"
+        ? `Contatto «${name}» aggiornato.`
+        : outcome.status === "gia_presente"
+          ? `«${name}» era già in rubrica.`
+          : `${name} aggiunto/a alla rubrica.`;
+    nextInQueueOrFinish();
   } catch (err) {
-    setError("contact-error", String(err));
+    setError("confirm-error", String(err));
+  }
+});
+
+document.getElementById("btn-confirm-cancel").addEventListener("click", nextInQueueOrFinish);
+
+document.getElementById("btn-confirm-back").addEventListener("click", () => {
+  importQueue = [];
+  if (importCandidates.length > 1) {
+    setView("screen-add-contact");
+    showChooser();
+  } else {
+    showAddContactScreen();
+  }
+});
+
+// ---- Metodo 1: fingerprint ----
+
+document.getElementById("btn-search-fingerprint").addEventListener("click", async (e) => {
+  const button = e.currentTarget;
+  clearImportMessages();
+  const fingerprint = document.getElementById("import-fingerprint").value;
+  const progress = document.getElementById("import-search-progress");
+  progress.textContent = torSettings.enabled
+    ? "Cerco la chiave tramite Tor… la prima volta può richiedere più di un minuto."
+    : "Cerco la chiave…";
+  progress.hidden = false;
+  try {
+    const result = await withLoading(button, () =>
+      invoke("search_contact_by_fingerprint", { fingerprint })
+    );
+    handleImportResult(result, "import-fingerprint-error");
+  } catch (err) {
+    setError("import-fingerprint-error", String(err));
+  } finally {
+    progress.hidden = true;
+    // Dopo la prima ricerca senza Tor la nota non va più mostrata.
+    if (!torSettings.enabled && !keyserverNoteShown) {
+      invoke("get_app_settings")
+        .then((s) => {
+          keyserverNoteShown = s.keyserver_note_shown;
+          renderKeyserverNote();
+        })
+        .catch(() => {});
+    }
+  }
+});
+
+document.getElementById("import-fingerprint").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") document.getElementById("btn-search-fingerprint").click();
+});
+
+// ---- Metodo 2: file ----
+
+async function importFromFile(path) {
+  showAddContactScreen();
+  try {
+    const result = await invoke("read_contact_file", { path });
+    handleImportResult(result, "import-file-error");
+  } catch (err) {
+    setError("import-file-error", String(err));
+  }
+}
+
+document.getElementById("btn-choose-key-file").addEventListener("click", async () => {
+  // Nessun filtro: si può scegliere qualunque file (.asc, .pgp, .gpg,
+  // .key, .txt...) e su Android un filtro per estensione escluderebbe i
+  // file che non hanno un tipo noto. Conta il contenuto, non il nome.
+  const path = await open({ multiple: false });
+  if (path) await importFromFile(path);
+});
+
+// ---- Metodo 3: testo incollato ----
+
+document.getElementById("btn-import-text").addEventListener("click", async () => {
+  clearImportMessages();
+  const text = document.getElementById("import-text").value;
+  if (!text.trim()) {
+    setError("import-text-error", "Incolla prima il testo della chiave.");
+    return;
+  }
+  try {
+    const result = await invoke("read_contact_text", { text });
+    handleImportResult(result, "import-text-error");
+  } catch (err) {
+    setError("import-text-error", String(err));
   }
 });
 

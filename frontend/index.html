@@ -517,23 +517,14 @@
       <div id="tab-contacts" class="tab-panel">
         <div class="card">
           <h2>Rubrica</h2>
-          <p>Incolla la chiave pubblica di un contatto (blocco "-----BEGIN PGP PUBLIC KEY BLOCK-----").</p>
-
-          <label for="contact-name">Nome del contatto</label>
-          <input id="contact-name" type="text" placeholder="Es. Giulia" />
-
-          <label for="contact-key">Chiave pubblica</label>
-          <textarea id="contact-key" rows="6" placeholder="-----BEGIN PGP PUBLIC KEY BLOCK-----..."></textarea>
+          <p>Le persone a cui puoi scrivere in modo cifrato. Puoi aggiungerne una con il suo fingerprint, con il file della sua chiave (.asc) o incollando il testo della chiave.</p>
 
           <div class="button-row">
-            <button id="btn-add-contact" class="primary">Aggiungi contatto</button>
+            <button id="btn-add-contact" class="primary" type="button">Aggiungi contatto</button>
           </div>
+          <p id="contact-flash" class="hint success-note" role="status" hidden></p>
           <p id="contact-error" class="error" hidden></p>
-
-          <div id="contact-added-hint" class="reveal-panel" hidden>
-            <p></p>
-            <p class="fingerprint-words"></p>
-          </div>
+          <p class="hint">Puoi anche trascinare qui il file .asc di una persona.</p>
 
           <h3>I tuoi contatti</h3>
           <ul id="contact-list" class="contact-list"></ul>
@@ -615,6 +606,128 @@
         </div>
         <p id="contact-detail-error" class="error" hidden></p>
         <p id="contact-detail-saved-hint" class="hint" hidden>Modifiche salvate.</p>
+      </div>
+    </section>
+
+    <!-- ============ SCHERMATA: aggiungi un contatto ============ -->
+    <section id="screen-add-contact" class="screen">
+      <div class="button-row advanced-top">
+        <button id="btn-close-add-contact" class="secondary" type="button">← Torna alla rubrica</button>
+      </div>
+
+      <div class="card">
+        <h2>Aggiungi un contatto</h2>
+
+        <div id="import-private-warning" class="warning" role="alert" hidden>
+          Questo file contiene una chiave PRIVATA. Non condividerla con
+          nessuno. Qui serve la chiave pubblica.
+        </div>
+
+        <div id="import-methods">
+          <p>Scegli il modo più comodo per ricevere la chiave della persona.</p>
+
+          <div class="import-method">
+            <h3>1. Con il fingerprint</h3>
+            <p class="hint">
+              È la sequenza di 40 lettere e numeri che accompagna la chiave
+              di una persona (per esempio sul suo sito). Puoi scriverla
+              come preferisci: maiuscole o minuscole, con o senza spazi.
+            </p>
+            <div class="inline-row">
+              <input id="import-fingerprint" type="text" autocomplete="off" autocapitalize="off" spellcheck="false"
+                     placeholder="Es. AA28 F0C4 8857 4E2C 540F E63D 2CCD D28E C64F A94C" />
+              <button id="btn-search-fingerprint" class="primary" type="button">Cerca</button>
+            </div>
+            <p id="import-search-progress" class="hint" role="status" hidden></p>
+            <p id="keyserver-note" class="hint" hidden>
+              La ricerca contatta un server pubblico (keys.openpgp.org).
+              Per maggiore riservatezza attiva Tor nelle impostazioni
+              Avanzate.
+            </p>
+            <p id="import-fingerprint-error" class="error" hidden></p>
+          </div>
+
+          <div class="import-method">
+            <h3>2. Con un file</h3>
+            <p class="hint">Il file della chiave pubblica, di solito con estensione .asc.</p>
+            <div id="import-dropzone" class="dropzone">
+              <button id="btn-choose-key-file" class="secondary" type="button">Scegli file .asc</button>
+              <p class="hint">oppure trascina qui il file</p>
+            </div>
+            <p id="import-file-error" class="error" hidden></p>
+          </div>
+
+          <div class="import-method">
+            <h3>3. Incollando il testo della chiave</h3>
+            <p class="hint">Il blocco che inizia con "-----BEGIN PGP PUBLIC KEY BLOCK-----".</p>
+            <textarea id="import-text" rows="6" placeholder="-----BEGIN PGP PUBLIC KEY BLOCK-----..."></textarea>
+            <div class="button-row">
+              <button id="btn-import-text" class="secondary" type="button">Continua</button>
+            </div>
+            <p id="import-text-error" class="error" hidden></p>
+          </div>
+        </div>
+
+        <div id="import-choose" hidden>
+          <h3 id="import-choose-title">Scegli le chiavi da aggiungere</h3>
+          <p class="hint">Per ognuna ti chiederò una conferma.</p>
+          <div id="import-choose-list" class="import-choose-list"></div>
+          <div class="button-row">
+            <button id="btn-choose-continue" class="primary" type="button">Continua</button>
+            <button id="btn-choose-back" class="secondary" type="button">Indietro</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ SCHERMATA: conferma del contatto ============ -->
+    <section id="screen-confirm-contact" class="screen">
+      <div class="button-row advanced-top">
+        <button id="btn-confirm-back" class="secondary" type="button">← Indietro</button>
+      </div>
+
+      <div class="card">
+        <h2>Conferma il contatto</h2>
+        <p id="confirm-progress" class="hint" hidden></p>
+
+        <div id="confirm-status-warning" class="warning" role="alert" hidden></div>
+        <div id="confirm-duplicate" class="warning" role="alert" hidden></div>
+        <div id="confirm-samename" class="warning" role="alert" hidden></div>
+
+        <label for="confirm-name">Nome</label>
+        <input id="confirm-name" type="text" placeholder="Es. Giulia" />
+
+        <label for="confirm-email">Email (facoltativa)</label>
+        <input id="confirm-email" type="text" placeholder="Es. giulia@esempio.it" />
+
+        <label for="confirm-notes">Note (facoltative)</label>
+        <textarea id="confirm-notes" rows="3" placeholder="Note personali su questo contatto..."></textarea>
+
+        <label>Fingerprint completo</label>
+        <p id="confirm-fingerprint" class="fingerprint-blocks"></p>
+        <label>Le stesse parole, da leggere a voce</label>
+        <p id="confirm-fingerprint-words" class="fingerprint-words"></p>
+        <p class="hint">
+          Chiave creata il <strong id="confirm-created"></strong> &middot;
+          <span id="confirm-expires"></span>
+        </p>
+
+        <div class="verify-note">
+          Prima di fidarti, controlla che questo fingerprint coincida con
+          quello che ti ha dato la persona (di persona, in videochiamata o
+          da un canale che sai essere suo).
+        </div>
+
+        <label id="confirm-override-row" class="checkbox-row" hidden>
+          <input type="checkbox" id="confirm-override" />
+          Ho capito il rischio: aggiungila comunque
+        </label>
+
+        <div class="button-row">
+          <button id="btn-confirm-add" class="primary" type="button">Aggiungi a Rubrica</button>
+          <button id="btn-confirm-cancel" class="secondary" type="button">Annulla</button>
+        </div>
+        <p id="confirm-error" class="error" hidden></p>
       </div>
     </section>
 
@@ -700,15 +813,19 @@
 
           <label class="checkbox-row">
             <input type="checkbox" id="tor-toggle" />
-            Verifica l'altezza blocco tramite Tor
+            Usa Tor per le richieste di rete
           </label>
           <p class="hint">
-            Instrada la verifica attraverso un client Tor già in
-            esecuzione sul tuo computer (es. Tor Browser, o il
-            programma "tor" da riga di comando) — Sigillo non include
-            un client Tor proprio. Disattivata per impostazione
-            predefinita: senza, la verifica avviene in chiaro verso il
-            servizio pubblico predefinito (mempool.space).
+            Instrada le richieste di rete — la verifica dell'altezza
+            blocco e la ricerca di un contatto per fingerprint —
+            attraverso un client Tor già in esecuzione sul tuo computer
+            (es. Tor Browser, o il programma "tor" da riga di comando);
+            Sigillo non include un client Tor proprio. Disattivata per
+            impostazione predefinita: senza, le richieste vanno in chiaro
+            verso i servizi pubblici (mempool.space per l'altezza blocco,
+            keys.openpgp.org per i contatti). Con Tor attivo, se Tor non
+            risponde la richiesta fallisce: non si ripiega mai su una
+            connessione diretta.
           </p>
 
           <div id="tor-fields" hidden>
