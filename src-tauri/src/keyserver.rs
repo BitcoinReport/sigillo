@@ -339,12 +339,14 @@ mod tests {
 
     #[test]
     fn no_connection_is_a_clear_error_that_points_to_the_file() {
-        // Nessuno ascolta su questa porta.
+        // Nessuno ascolta su questa porta: su macOS/Linux la connessione
+        // e' rifiutata subito (Offline), su Windows una porta di loopback
+        // chiusa lascia scadere il tempo (Timeout). In entrambi i casi il
+        // messaggio e' comprensibile e indica l'alternativa del file.
         let (c, t) = (Duration::from_secs(2), Duration::from_secs(3));
         let err = fetch_verified_key("http://127.0.0.1:1", &"A".repeat(40), &Route::Direct, c, t).unwrap_err();
-        assert!(matches!(err, KeyserverError::Offline(_)), "{err:?}");
-        assert!(err.user_message().contains("file .asc"));
-        assert!(err.user_message().contains("connessione"));
+        assert!(matches!(err, KeyserverError::Offline(_) | KeyserverError::Timeout), "{err:?}");
+        assert!(err.user_message().contains("file .asc"), "{}", err.user_message());
     }
 
     // ---------- Tor ----------
