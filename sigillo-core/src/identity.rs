@@ -15,7 +15,11 @@ use zeroize::Zeroizing;
 
 use sequoia_openpgp as openpgp;
 use openpgp::packet::key::{Key4, PrimaryRole, SecretParts, SubordinateRole};
+use openpgp::crypto::hash::Digest;
+use openpgp::crypto::{KeyPair, Signer};
 use openpgp::packet::prelude::*;
+use openpgp::packet::signature::subpacket::SubpacketTag;
+use openpgp::packet::signature::SignatureFields;
 use openpgp::parse::Parse;
 use openpgp::types::{KeyFlags, SignatureType};
 use openpgp::Cert;
@@ -98,6 +102,46 @@ fn hkdf_derive_32(seed: &[u8], info: &[u8]) -> Zeroizing<[u8; 32]> {
     okm
 }
 
+/// Firma di auto-certificazione interamente deterministica: stessa chiave,
+/// stessi byte, ogni volta.
+///
+/// Il fingerprint non dipende dalle firme, ma il blocco `PUBLIC KEY BLOCK`
+/// sì. Sequoia, per default, mette in ogni firma l'ora corrente e un valore
+/// casuale (la notazione `salt@notations.sequoia-pgp.org`): il blocco
+/// cambierebbe a ogni avvio pur essendo la stessa chiave. Qui l'ora è la
+/// stessa data fissa della chiave e il valore casuale viene tolto prima di
+/// firmare. Ed25519 è deterministico (RFC 8032), quindi il risultato lo è.
+fn sign_deterministic(
+    builder: SignatureBuilder,
+    signer: &mut KeyPair,
+    ctime: SystemTime,
+    hash_fields: impl FnOnce(&SignatureFields, &mut dyn Digest),
+) -> Result<Signature> {
+    let mut builder = builder
+        .set_signature_creation_time(ctime)?
+        .pre_sign(signer)?;
+    builder
+        .hashed_area_mut()
+        .remove_all(SubpacketTag::NotationData);
+
+    let hash_algo = builder.hash_algo();
+    let mut context = hash_algo.context()?;
+    hash_fields(&builder, &mut context);
+    let digest = context.into_digest()?;
+    let mpis = signer.sign(hash_algo, &digest)?;
+
+    Ok(Signature4::new(
+        builder.typ(),
+        signer.public().pk_algo(),
+        hash_algo,
+        builder.hashed_area().clone(),
+        builder.unhashed_area().clone(),
+        [digest[0], digest[1]],
+        mpis,
+    )
+    .into())
+}
+
 /// Costruisce il certificato OpenPGP a partire dal seed BIP39 a 64 byte, in
 /// modo interamente deterministico: stesso seed => stesso fingerprint,
 /// sempre, su qualunque dispositivo.
@@ -116,9 +160,13 @@ fn build_cert(seed64: &[u8; 64], display_name: &str) -> Result<Cert> {
         .into_keypair()
         .context("impossibile usare la chiave primaria per firmare")?;
 
-    let direct_key_sig = SignatureBuilder::new(SignatureType::DirectKey)
-        .set_key_flags(KeyFlags::empty().set_certification().set_signing())?
-        .sign_direct_key(&mut primary_signer, primary.parts_as_public())?;
+    let direct_key_sig = sign_deterministic(
+        SignatureBuilder::new(SignatureType::DirectKey)
+            .set_key_flags(KeyFlags::empty().set_certification().set_signing())?,
+        &mut primary_signer,
+        ctime,
+        |fields, hash| fields.hash_direct_key(hash, primary.parts_as_public()),
+    )?;
 
     let cert = Cert::try_from(vec![
         Packet::SecretKey(primary.clone()),
@@ -129,10 +177,14 @@ fn build_cert(seed64: &[u8; 64], display_name: &str) -> Result<Cert> {
 
     // 2. User ID: solo un nome scelto dall'utente, nessuna email richiesta.
     let uid = UserID::from(display_name);
-    let uid_sig = SignatureBuilder::new(SignatureType::PositiveCertification)
-        .set_primary_userid(true)?
-        .set_key_flags(KeyFlags::empty().set_certification().set_signing())?
-        .sign_userid_binding(&mut primary_signer, primary.parts_as_public(), &uid)?;
+    let uid_sig = sign_deterministic(
+        SignatureBuilder::new(SignatureType::PositiveCertification)
+            .set_primary_userid(true)?
+            .set_key_flags(KeyFlags::empty().set_certification().set_signing())?,
+        &mut primary_signer,
+        ctime,
+        |fields, hash| fields.hash_userid_binding(hash, primary.parts_as_public(), &uid),
+    )?;
     acc.push(Packet::from(uid));
     acc.push(Packet::from(uid_sig));
 
@@ -144,13 +196,16 @@ fn build_cert(seed64: &[u8; 64], display_name: &str) -> Result<Cert> {
             .context("derivazione della sottochiave X25519 fallita")?
             .into();
 
-    let subkey_sig = SignatureBuilder::new(SignatureType::SubkeyBinding)
-        .set_key_flags(
+    let subkey_sig = sign_deterministic(
+        SignatureBuilder::new(SignatureType::SubkeyBinding).set_key_flags(
             KeyFlags::empty()
                 .set_transport_encryption()
                 .set_storage_encryption(),
-        )?
-        .sign_subkey_binding(&mut primary_signer, primary.parts_as_public(), &subkey)?;
+        )?,
+        &mut primary_signer,
+        ctime,
+        |fields, hash| fields.hash_subkey_binding(hash, primary.parts_as_public(), &subkey),
+    )?;
     acc.push(Packet::from(subkey));
     acc.push(Packet::from(subkey_sig));
 
@@ -320,6 +375,34 @@ mod tests {
         // il fingerprint copre solo la chiave primaria, non lo User ID.
         let reimported_other_name = import(&phrase, "Alice (altro dispositivo)").unwrap();
         assert_eq!(original.cert.fingerprint(), reimported_other_name.cert.fingerprint());
+    }
+
+    #[test]
+    fn public_key_block_is_byte_identical_across_rebuilds() {
+        use openpgp::policy::StandardPolicy;
+        use openpgp::serialize::SerializeInto;
+
+        let original = generate(SeedWordCount::TwentyFour, "Alice").unwrap();
+        let phrase = original.seed_phrase().unwrap();
+        let first = original.cert.armored().to_vec().unwrap();
+
+        // Le firme di auto-certificazione hanno una data a risoluzione di
+        // secondo: aspettiamo per essere certi che "adesso" sarebbe diverso.
+        std::thread::sleep(Duration::from_millis(2100));
+        let rebuilt = import(&phrase, "Alice").unwrap();
+        let second = rebuilt.cert.armored().to_vec().unwrap();
+
+        assert_eq!(
+            String::from_utf8(first).unwrap(),
+            String::from_utf8(second).unwrap(),
+            "il blocco PUBLIC KEY BLOCK deve dipendere solo dalla seed phrase e dal nome"
+        );
+
+        // La data fissa nel 2009 non deve rendere la chiave inutilizzabile.
+        let policy = StandardPolicy::new();
+        let valid = rebuilt.cert.with_policy(&policy, None).unwrap();
+        assert!(valid.keys().alive().revoked(false).for_transport_encryption().next().is_some());
+        assert!(valid.keys().alive().revoked(false).for_signing().next().is_some());
     }
 
     #[test]
